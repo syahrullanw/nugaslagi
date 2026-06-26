@@ -1,0 +1,104 @@
+{
+  "theme": "LIGHT",
+  "archetype": "4 (Swiss & High-Contrast)",
+  "rationale": "The platform requires high data density and clear structuring for grading rubrics, assignment statuses, and student monitoring. A Swiss & High-Contrast theme provides a pristine, distraction-free environment for both the lecturer managing complex tasks (dashboard, course management, rubrics) and students navigating their learning path. We soften it slightly from pure brutalism using deep slate and subtle academic blue accents to evoke trust, focus, and professionalism.",
+  "colors": {
+    "primary": {
+      "base": "#0F172A",
+      "hover": "#1E293B",
+      "foreground": "#FFFFFF",
+      "description": "Deep Slate for high contrast authority on main buttons and sidebars."
+    },
+    "secondary": {
+      "base": "#FFFFFF",
+      "hover": "#F8FAFC",
+      "foreground": "#0F172A",
+      "border": "#E2E8F0"
+    },
+    "accent": {
+      "blue": "#2563EB",
+      "blue_light": "#DBEAFE",
+      "red": "#DC2626",
+      "red_light": "#FEE2E2",
+      "green": "#16A34A",
+      "green_light": "#DCFCE7",
+      "yellow": "#CA8A04",
+      "yellow_light": "#FEF9C3",
+      "description": "Functional accents for submission states: Aman (Green), Perlu Perhatian (Yellow), Risiko Tinggi (Red)."
+    },
+    "background": {
+      "main": "#F8FAFC",
+      "surface": "#FFFFFF",
+      "card": "#FFFFFF",
+      "sidebar": "#0F172A"
+    },
+    "text": {
+      "primary": "#0F172A",
+      "secondary": "#475569",
+      "muted": "#94A3B8"
+    }
+  },
+  "typography": {
+    "fonts": {
+      "heading": "Outfit, sans-serif",
+      "body": "IBM Plex Sans, sans-serif",
+      "mono": "JetBrains Mono, monospace"
+    },
+    "scales": {
+      "h1": "text-4xl lg:text-5xl font-bold tracking-tight text-slate-900",
+      "h2": "text-2xl lg:text-3xl font-semibold tracking-tight text-slate-900",
+      "h3": "text-xl font-medium tracking-tight text-slate-900",
+      "h4": "text-lg font-medium tracking-tight text-slate-900",
+      "body": "text-base text-slate-700 leading-relaxed",
+      "small": "text-sm text-slate-500",
+      "overline": "text-xs font-semibold uppercase tracking-[0.2em] text-slate-500"
+    }
+  },
+  "layout_and_spacing": {
+    "philosophy": "Control Room Grid for the Lecturer Dashboard; generous padding (p-6, p-8) for forms and course materials.",
+    "dashboard_grid": "grid-cols-1 md:grid-cols-3 lg:grid-cols-4 gap-6",
+    "widget_spans": {
+      "summary": "col-span-1",
+      "main_chart": "col-span-2 lg:col-span-3",
+      "feed": "col-span-1 row-span-2"
+    },
+    "container_padding": "p-6 md:p-8",
+    "corners": "rounded-none or rounded-md (max 6px) for a crisp, functional look.",
+    "borders": "1px solid #E2E8F0, relying on borders and structure rather than shadows for widgets."
+  },
+  "components_strategy": {
+    "cards": "Go mostly flat with 1px borders. Use subtle shadow only on hover for clickable items like courses. Do not overuse card wrapping for simple text.",
+    "buttons": "Sharp edges (rounded-md), solid deep slate or academic blue.",
+    "navigation": "Lecturer side: Fixed left sidebar (Deep Slate) with stark white text. Student side: Top sticky navigation with crystal glassmorphism or clean white background.",
+    "forms": "Standard Shadcn UI inputs, minimal rounding, left-aligned labels.",
+    "tables": "Dense, highly scannable. Hover states on rows. Used for Student Lists and Grading.",
+    "badges": "Crucial for student status (Aman, Risiko Tinggi) and assignment status (Belum Submit, Dinilai, Revisi). Small, pill-shaped, soft background with hard text.",
+    "icons": "lucide-react (Default for dashboards)"
+  },
+  "media": {
+    "logo_url": "/app-icon.svg",
+    "auth_background_url": "https://images.unsplash.com/photo-1523580846011-d3a5bc25702b?crop=entropy&cs=srgb&fm=jpg&ixlib=rb-4.1.0&q=85",
+    "course_covers": [
+      "https://images.unsplash.com/photo-1775933802859-27889463db79?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NDQ2NDN8MHwxfHNlYXJjaHwzfHxtb2Rlcm4lMjB1bml2ZXJzaXR5JTIwY2FtcHVzfGVufDB8fHx8MTc3OTU1MDU0N3ww&ixlib=rb-4.1.0&q=85",
+      "https://images.pexels.com/photos/35427325/pexels-photo-35427325.jpeg?auto=compress&cs=tinysrgb&dpr=2&h=650&w=940"
+    ],
+    "practicum_covers": [
+      "https://images.unsplash.com/photo-1619410283995-43d9134e7656?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjA1MDZ8MHwxfHNlYXJjaHwxfHxjb21wdXRlciUyMHNjaWVuY2UlMjBwcm9ncmFtbWluZyUyMHNjcmVlbnxlbnwwfHx8fDE3Nzk1NTA1NDd8MA&ixlib=rb-4.1.0&q=85"
+    ]
+  },
+  "accessibility_and_testing": {
+    "contrast": "Ensure all text against colored badges and backgrounds meets WCAG AA / APCA standards.",
+    "data_testid": "ALL interactive elements MUST include data-testid. Format: kebab-case, role-based. Examples: login-submit-button, course-card-123, upload-assignment-btn."
+  },
+  "instructions_to_main_agent": [
+    "Build the dashboard using React, Tailwind CSS, and Shadcn UI (.js files ONLY, NO .tsx).",
+    "Implement two separate views/layouts: Lecturer (Admin) with a sidebar layout, and Student with a top-nav layout.",
+    "Use 'Outfit' for headings and 'IBM Plex Sans' for body text. Apply them in tailwind.config.js.",
+    "Prioritize the core MVP flow: Authentication (Email/Password for Dosen, Class Code for Mahasiswa), Course Management, Assignment Creation, Google Drive File Upload, and Grading with Weights.",
+    "Do NOT use placeholder text or dummy image URLs for the logo or course covers. Use the exact URLs provided in this file.",
+    "Implement Shadcn UI for complex components like dropdowns, tabs (course materials vs assignments vs students), dialogs (create class), and tables (grading/students).",
+    "In the Practicum Mode, use the 'practicum_covers' for default visual context.",
+    "Defer actual WhatsApp integration; just create the UI logs and 'Send Reminder' buttons that simulate the action.",
+    "Add 'data-testid' to EVERY button, link, and form input."
+  ]
+}

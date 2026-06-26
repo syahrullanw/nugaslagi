@@ -1,0 +1,53 @@
+{
+  "summary": "Ran focused backend + frontend regression for revised grading/material/settings/class lifecycle/class-user management features on public URL. Backend endpoints passed; UI flows passed with one data-seeding gap and one non-blocking console warning.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [
+      {
+        "flow": "Student material panel (demo seeded student)",
+        "issue": "Demo seeded assignment 'Praktikum CRUD API' currently has material_id=null, so linked assignment section does not appear for seeded student Alya even though UI logic works when assignment.material_id matches material.id.",
+        "affected_selectors": [
+          "[data-testid^='student-material-linked-assignments-']",
+          "[data-testid='student-material-card']"
+        ]
+      }
+    ],
+    "design_issues": [
+      {
+        "screen": "Admin Students page",
+        "issues": [
+          "Browser console shows invalid DOM nesting warning: <span> rendered inside <option> (hydration warning, currently non-blocking)."
+        ]
+      }
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_revision_feature_set.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Backfill or migrate seeded demo assignment data so assignment.material_id matches a valid material.id for WEB4A1 demo student flow.",
+    "Fix invalid nested element in select/option rendering to remove hydration warning in console."
+  ],
+  "critical_code_review_comments": [
+    "Revised feature implementation is generally correct; backend endpoint contracts are consistent and data-testid coverage is good.",
+    "Console warning indicates rendering artifact likely from instrumentation/wrapper inserting span within option; should still be corrected to prevent future hydration issues."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_revision_feature_set.py",
+    "/app/test_reports/iteration_2.json"
+  ],
+  "success_rate": {
+    "backend": "100%",
+    "frontend": "92%"
+  },
+  "seed_data_creation": "Created transient test data via APIs/UI: new course/class/materials/linked assignment, two test students, submissions, grading records, ended class state.",
+  "retest_needed": true,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Use rev.student1.19f5f4fe@demo.id / Mahasiswa123! to verify positive linked-assignment student panel behavior (2 linked blocks confirmed). Demo seeded Alya account currently does not show linked block due to material_id null on seeded assignment.",
+  "rca of the issue": "RCA for seeded-student linked assignment visibility: UI code filters linked assignments with strict condition assignment.material_id === material.id. For seeded Alya data, /api/assignments returns Praktikum CRUD API with material_id null while /api/materials returns Arsitektur Aplikasi Full-stack with id 161d4d75-0a97-42e2-8266-87144580a39b, so no match and no linked block renders. Mitigation: data migration/backfill for seeded assignment material_id or recreate seeded assignment with correct material link."
+}
