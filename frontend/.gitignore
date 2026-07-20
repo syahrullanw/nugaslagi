@@ -9,7 +9,7 @@
 /coverage
 
 # production
-/build
+# /build  # uncomment to exclude build from repo
 
 # misc
 .DS_Store
