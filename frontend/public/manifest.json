@@ -1,0 +1,12 @@
+{
+  "short_name": "E-Learning",
+  "name": "E-Learning Dosen",
+  "description": "PWA e-learning pribadi untuk dosen dan mahasiswa.",
+  "start_url": "/",
+  "display": "standalone",
+  "theme_color": "#0F172A",
+  "background_color": "#F8FAFC",
+  "icons": [
+    { "src": "/app-icon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
