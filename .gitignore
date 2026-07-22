@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+!frontend/.env.production
 __pycache__/
 *.pyc
 node_modules/
@@ -10,3 +13,12 @@ venv/
 backend/storage/
 ._*
 backend/.drive_config.key
+*.pem
+*.p12
+*.key
+*service-account*.json
+credentials*.json
+*.dump
+*.backup
+*.sql.gz
+backups/

@@ -3,13 +3,14 @@
 import io
 import os
 import uuid
+import asyncio
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 import pytest
 import requests
 from dotenv import load_dotenv
 from openpyxl import load_workbook
-from pymongo import MongoClient
 
 
 load_dotenv("/app/frontend/.env")
@@ -19,9 +20,9 @@ BASE_URL = os.environ.get("REACT_APP_BACKEND_URL")
 assert BASE_URL, "REACT_APP_BACKEND_URL is required"
 API_BASE = f"{BASE_URL.rstrip('/')}/api"
 
-MONGO_URL = os.environ.get("MONGO_URL")
-DB_NAME = os.environ.get("DB_NAME")
-assert MONGO_URL and DB_NAME, "MONGO_URL and DB_NAME are required"
+DATABASE_URL = os.environ.get("DATABASE_URL")
+assert DATABASE_URL, "DATABASE_URL is required"
+DATABASE_URL = DATABASE_URL.replace("postgresql+asyncpg://", "postgresql://", 1)
 
 DEFAULT_PREDICATES = [
     {"label": "A", "min_score": 85, "max_score": 100},
@@ -30,6 +31,17 @@ DEFAULT_PREDICATES = [
     {"label": "D", "min_score": 50, "max_score": 59.99},
     {"label": "E", "min_score": 0, "max_score": 49.99},
 ]
+
+
+def _postgres_execute(sql: str, *params) -> None:
+    async def execute():
+        connection = await asyncpg.connect(DATABASE_URL)
+        try:
+            await connection.execute(sql, *params)
+        finally:
+            await connection.close()
+
+    asyncio.run(execute())
 
 
 def _auth(identifier: str, password: str) -> dict:
@@ -163,11 +175,9 @@ def restore_global_defaults(auth_state):
 
 def test_default_grade_predicates_returned_when_global_override_missing(auth_state):
     # Predicate module: default A-E ranges are used when global db override is absent.
-    mongo = MongoClient(MONGO_URL)
-    try:
-        mongo[DB_NAME].grade_predicates.delete_one({"class_id": ""})
-    finally:
-        mongo.close()
+    _postgres_execute(
+        "DELETE FROM app_doc_grade_predicates WHERE data->>'class_id' = ''"
+    )
 
     resp = requests.get(f"{API_BASE}/grade-predicates", headers=auth_state["admin_headers"], timeout=45)
     assert resp.status_code == 200, resp.text
@@ -354,11 +364,11 @@ def test_list_submissions_enriches_missing_grade_predicate(auth_state):
     assert grade_resp.status_code == 200, grade_resp.text
     assert grade_resp.json().get("grade_predicate") == "C"
 
-    mongo = MongoClient(MONGO_URL)
-    try:
-        mongo[DB_NAME].submissions.update_one({"id": submission["id"]}, {"$unset": {"grade_predicate": ""}})
-    finally:
-        mongo.close()
+    _postgres_execute(
+        "UPDATE app_doc_submissions SET data = data - 'grade_predicate', updated_at = NOW() "
+        "WHERE data->>'id' = $1",
+        submission["id"],
+    )
 
     list_resp = requests.get(f"{API_BASE}/submissions", headers=admin_headers, timeout=45)
     assert list_resp.status_code == 200, list_resp.text

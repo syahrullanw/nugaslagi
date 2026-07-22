@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: elearning_dosen
+      POSTGRES_USER: nugaslagi
+      POSTGRES_PASSWORD: nugaslagi
+    ports:
+      - "5432:5432"
+    volumes:
+      - nugaslagi_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nugaslagi -d elearning_dosen"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  nugaslagi_postgres_data:

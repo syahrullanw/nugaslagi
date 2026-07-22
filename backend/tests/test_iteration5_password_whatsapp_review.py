@@ -1,16 +1,14 @@
 """Iteration 5 regression tests: auth reset via OTP, WhatsApp settings/messages, and submission review-revision flow."""
 
 import os
+import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 
+import asyncpg
 import pytest
 import requests
 from dotenv import load_dotenv
-
-try:
-    from pymongo import MongoClient
-except Exception:  # pragma: no cover
-    MongoClient = None
 
 
 load_dotenv("/app/frontend/.env")
@@ -45,20 +43,27 @@ def _auth_header(token: str):
 
 
 @pytest.fixture(scope="module")
-def mongo_db():
-    # DB integration module: fetch OTP directly to validate reset-password-otp endpoint end-to-end.
-    if MongoClient is None:
-        pytest.skip("pymongo not installed; cannot read OTP from MongoDB")
+def postgres_url():
+    # DB integration module: fetch OTP directly to validate reset-password-otp end-to-end.
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        pytest.skip("DATABASE_URL not configured")
+    return url.replace("postgresql+asyncpg://", "postgresql://", 1)
 
-    mongo_url = os.environ.get("MONGO_URL")
-    db_name = os.environ.get("DB_NAME")
-    if not mongo_url or not db_name:
-        pytest.skip("MONGO_URL/DB_NAME not configured")
 
-    client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
-    db = client[db_name]
-    yield db
-    client.close()
+def _postgres_document(url: str, collection: str, where_sql: str, *params, order_by: str = ""):
+    async def fetch():
+        connection = await asyncpg.connect(url)
+        try:
+            value = await connection.fetchval(
+                f"SELECT data FROM app_doc_{collection} WHERE ({where_sql}) {order_by} LIMIT 1",
+                *params,
+            )
+            return json.loads(value) if isinstance(value, str) else value
+        finally:
+            await connection.close()
+
+    return asyncio.run(fetch())
 
 
 def test_login_and_change_password_flow_still_works():
@@ -89,7 +94,7 @@ def test_login_and_change_password_flow_still_works():
     assert revert_resp.json().get("ok") is True
 
 
-def test_forgot_password_enqueues_whatsapp_and_reset_password_otp_works(mongo_db):
+def test_forgot_password_enqueues_whatsapp_and_reset_password_otp_works(postgres_url):
     # Forgot/reset module: forgot-password creates OTP and WhatsApp queue entry, reset-password-otp updates credentials.
     forgot_resp = requests.post(
         f"{API_BASE}/auth/forgot-password",
@@ -113,21 +118,22 @@ def test_forgot_password_enqueues_whatsapp_and_reset_password_otp_works(mongo_db
     assert latest_msg.get("to"), latest_msg
     assert latest_msg.get("status") in ["pending_config", "pending", "sent", "failed"]
 
-    user = mongo_db.users.find_one({"email": STUDENT_EMAIL}, {"_id": 0})
+    user = _postgres_document(postgres_url, "users", "data->>'email' = $1", STUDENT_EMAIL)
     assert user is not None
-    otp_doc = (
-        mongo_db.password_reset_otps.find({"user_id": user["id"], "status": "active"}, {"_id": 0})
-        .sort("created_at", -1)
-        .limit(1)
+    otp = _postgres_document(
+        postgres_url,
+        "password_reset_otps",
+        "data->>'user_id' = $1 AND data->>'status' = $2",
+        user["id"],
+        "active",
+        order_by="ORDER BY data->>'created_at' DESC",
     )
-    otp_list = list(otp_doc)
-    assert otp_list, "No active OTP found in DB"
-    otp = otp_list[0]["otp"]
+    assert otp, "No active OTP found in DB"
 
     reset_password = "Mahasiswa123!R"
     reset_resp = requests.post(
         f"{API_BASE}/auth/reset-password-otp",
-        json={"identifier": STUDENT_IDENTIFIER, "otp": otp, "new_password": reset_password},
+        json={"identifier": STUDENT_IDENTIFIER, "otp": otp["otp"], "new_password": reset_password},
         timeout=40,
     )
     assert reset_resp.status_code == 200, reset_resp.text

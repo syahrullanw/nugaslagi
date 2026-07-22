@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# Only required by scripts/migrate_mongodb_to_postgresql.py.
+pymongo==4.5.0

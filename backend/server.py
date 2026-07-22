@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import asyncio
 import base64
+import gzip
 import hashlib
 import html
 import json
@@ -18,31 +19,40 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import bcrypt
 from cryptography.fernet import Fernet, InvalidToken
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from dotenv import load_dotenv
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
+from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
-from motor.motor_asyncio import AsyncIOMotorClient
 from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, EmailStr, Field
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
+try:
+    from .postgres_database import PostgresDatabase
+    from .app_version import version_payload
+except ImportError:  # Supports `uvicorn server:app` from the backend directory.
+    from postgres_database import PostgresDatabase
+    from app_version import version_payload
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
-mongo_url = os.environ["MONGO_URL"]
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ["DB_NAME"]]
+db = PostgresDatabase(os.environ["DATABASE_URL"])
 
 app = FastAPI(title="E-Learning Dosen API")
 api_router = APIRouter(prefix="/api")
@@ -55,6 +65,53 @@ _material_creation_lock = asyncio.Lock()
 _settings_cache: Dict[str, Any] = {}
 _settings_cache_times: Dict[str, float] = {}
 _SETTINGS_CACHE_TTL = 30.0
+_oidc_discovery_cache: Dict[str, Any] = {}
+_oidc_discovery_cached_at = 0.0
+_OIDC_DISCOVERY_CACHE_TTL = 300.0
+_oidc_runtime_settings: Dict[str, Any] = {}
+
+
+def env_enabled(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def environment_oidc_settings() -> Dict[str, Any]:
+    discovery_url = os.environ.get("OIDC_DISCOVERY_URL", "").strip()
+    client_id = os.environ.get("OIDC_CLIENT_ID", "").strip()
+    redirect_uri = os.environ.get("OIDC_REDIRECT_URI", "").strip()
+    frontend_url = os.environ.get("OIDC_FRONTEND_URL", os.environ.get("APP_URL", "http://127.0.0.1:3000")).strip().rstrip("/")
+    return {
+        "enabled": env_enabled("OIDC_ENABLED", bool(discovery_url and client_id and redirect_uri)),
+        "discovery_url": discovery_url,
+        "issuer": os.environ.get("OIDC_ISSUER", "").strip().rstrip("/"),
+        "client_id": client_id,
+        "client_secret": os.environ.get("OIDC_CLIENT_SECRET", "").strip(),
+        "redirect_uri": redirect_uri,
+        "frontend_url": frontend_url,
+        "scopes": os.environ.get("OIDC_SCOPES", "openid profile email roles").strip(),
+        "local_login_enabled": env_enabled("OIDC_LOCAL_LOGIN_ENABLED", True),
+    }
+
+
+def oidc_settings() -> Dict[str, Any]:
+    return {**environment_oidc_settings(), **_oidc_runtime_settings}
+
+
+def clear_oidc_discovery_cache() -> None:
+    global _oidc_discovery_cache, _oidc_discovery_cached_at
+    _oidc_discovery_cache = {}
+    _oidc_discovery_cached_at = 0.0
+
+
+def oidc_require_settings() -> Dict[str, Any]:
+    settings = oidc_settings()
+    missing = [key for key in ["discovery_url", "client_id", "redirect_uri", "frontend_url"] if not settings.get(key)]
+    if not settings["enabled"] or missing:
+        raise HTTPException(status_code=503, detail="Login SCI-ID belum dikonfigurasi")
+    return settings
 
 
 def _get_cached_settings(key: str) -> Optional[Dict[str, Any]]:
@@ -80,6 +137,175 @@ def _invalidate_settings_cache(key: str = "") -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def base64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + ("=" * (-len(value) % 4)))
+
+
+def base64url_encode(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).decode("ascii").rstrip("=")
+
+
+async def oidc_discovery(force: bool = False) -> Dict[str, Any]:
+    global _oidc_discovery_cache, _oidc_discovery_cached_at
+    settings = oidc_require_settings()
+    if not force and _oidc_discovery_cache and time.time() - _oidc_discovery_cached_at < _OIDC_DISCOVERY_CACHE_TTL:
+        return _oidc_discovery_cache
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            response = await http.get(settings["discovery_url"], headers={"Accept": "application/json"})
+            response.raise_for_status()
+            metadata = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        logger.warning("OIDC discovery SCI-ID gagal: %s", exc)
+        raise HTTPException(status_code=503, detail="SCI-ID sedang tidak dapat dihubungi") from exc
+    required = ["issuer", "authorization_endpoint", "token_endpoint", "jwks_uri", "end_session_endpoint"]
+    if not isinstance(metadata, dict) or any(not metadata.get(key) for key in required):
+        raise HTTPException(status_code=503, detail="Metadata OIDC SCI-ID tidak lengkap")
+    expected_issuer = settings["issuer"] or metadata["issuer"]
+    if metadata["issuer"].rstrip("/") != expected_issuer.rstrip("/"):
+        raise HTTPException(status_code=503, detail="Issuer OIDC SCI-ID tidak sesuai konfigurasi")
+    _oidc_discovery_cache = metadata
+    _oidc_discovery_cached_at = time.time()
+    return metadata
+
+
+def oidc_roles(claims: Dict[str, Any], client_id: str) -> List[str]:
+    roles: set[str] = set()
+    realm_access = claims.get("realm_access")
+    if isinstance(realm_access, dict) and isinstance(realm_access.get("roles"), list):
+        roles.update(str(role) for role in realm_access["roles"])
+    resource_access = claims.get("resource_access")
+    client_access = resource_access.get(client_id) if isinstance(resource_access, dict) else None
+    if isinstance(client_access, dict) and isinstance(client_access.get("roles"), list):
+        roles.update(str(role) for role in client_access["roles"])
+    return sorted(roles)
+
+
+def oidc_application_role(claims: Dict[str, Any], client_id: str) -> str:
+    roles = set(oidc_roles(claims, client_id))
+    if "super_admin" in roles:
+        return "admin"
+    if "dosen" in roles:
+        return "lecturer"
+    if "mahasiswa" in roles:
+        return "student"
+    raise HTTPException(status_code=403, detail="Akun SCI-ID belum memiliki role dosen, mahasiswa, atau super_admin")
+
+
+async def validate_oidc_id_token(id_token: str, metadata: Dict[str, Any], expected_nonce: str) -> Dict[str, Any]:
+    settings = oidc_require_settings()
+    parts = id_token.split(".")
+    if len(parts) != 3:
+        raise HTTPException(status_code=401, detail="Format ID token SCI-ID tidak valid")
+    try:
+        header = json.loads(base64url_decode(parts[0]))
+        claims = json.loads(base64url_decode(parts[1]))
+        signature = base64url_decode(parts[2])
+    except (ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=401, detail="ID token SCI-ID tidak dapat dibaca") from exc
+    if header.get("alg") != "RS256" or not header.get("kid"):
+        raise HTTPException(status_code=401, detail="Algoritma ID token SCI-ID tidak diizinkan")
+    try:
+        async with httpx.AsyncClient(timeout=10) as http:
+            jwks_response = await http.get(metadata["jwks_uri"], headers={"Accept": "application/json"})
+            jwks_response.raise_for_status()
+            jwks = jwks_response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(status_code=503, detail="Kunci verifikasi SCI-ID tidak dapat dimuat") from exc
+    key = next((item for item in jwks.get("keys", []) if item.get("kid") == header["kid"] and item.get("kty") == "RSA"), None)
+    if not key or not key.get("n") or not key.get("e"):
+        raise HTTPException(status_code=401, detail="Kunci ID token SCI-ID tidak ditemukan")
+    try:
+        public_key = rsa.RSAPublicNumbers(
+            int.from_bytes(base64url_decode(key["e"]), "big"),
+            int.from_bytes(base64url_decode(key["n"]), "big"),
+        ).public_key()
+        public_key.verify(signature, f"{parts[0]}.{parts[1]}".encode("ascii"), padding.PKCS1v15(), hashes.SHA256())
+    except (InvalidSignature, ValueError) as exc:
+        raise HTTPException(status_code=401, detail="Signature ID token SCI-ID tidak valid") from exc
+    now = int(time.time())
+    issuer = settings["issuer"] or metadata["issuer"]
+    audiences = claims.get("aud") if isinstance(claims.get("aud"), list) else [claims.get("aud")]
+    if claims.get("iss", "").rstrip("/") != issuer.rstrip("/"):
+        raise HTTPException(status_code=401, detail="Issuer ID token SCI-ID tidak sesuai")
+    if settings["client_id"] not in audiences:
+        raise HTTPException(status_code=401, detail="Audience ID token SCI-ID tidak sesuai")
+    if claims.get("azp") and claims["azp"] != settings["client_id"]:
+        raise HTTPException(status_code=401, detail="Authorized party ID token SCI-ID tidak sesuai")
+    if not isinstance(claims.get("exp"), (int, float)) or now - 30 >= int(claims["exp"]):
+        raise HTTPException(status_code=401, detail="ID token SCI-ID sudah kedaluwarsa")
+    if isinstance(claims.get("nbf"), (int, float)) and now + 30 < int(claims["nbf"]):
+        raise HTTPException(status_code=401, detail="ID token SCI-ID belum berlaku")
+    if isinstance(claims.get("iat"), (int, float)) and int(claims["iat"]) > now + 60:
+        raise HTTPException(status_code=401, detail="Waktu penerbitan ID token SCI-ID tidak valid")
+    if not claims.get("nonce") or not secrets.compare_digest(str(claims["nonce"]), expected_nonce):
+        raise HTTPException(status_code=401, detail="Nonce login SCI-ID tidak sesuai")
+    if not str(claims.get("sub", "")).strip():
+        raise HTTPException(status_code=401, detail="Subject ID token SCI-ID tidak valid")
+    return claims
+
+
+def oidc_frontend_redirect(**params: str) -> str:
+    base = oidc_require_settings()["frontend_url"]
+    clean = {key: value for key, value in params.items() if value}
+    return f"{base}/?{urlencode(clean)}" if clean else base
+
+
+async def provision_oidc_user(claims: Dict[str, Any]) -> Dict[str, Any]:
+    settings = oidc_require_settings()
+    issuer = settings["issuer"] or str(claims["iss"])
+    subject = str(claims["sub"])
+    role = oidc_application_role(claims, settings["client_id"])
+    username = str(claims.get("preferred_username") or f"sso-{subject[:12]}").strip().lower()
+    email = str(claims.get("email") or f"sso-{subject}@local.invalid").strip().lower()
+    name = str(claims.get("name") or username).strip()
+    linked = await db.users.find_one({"sso_issuer": issuer, "sso_subject": subject}, {"_id": 0})
+    if not linked:
+        matches = await db.users.find({"$or": [{"email": email}, {"username": username}]}, {"_id": 0}).to_list(3)
+        unique_matches = {item["id"]: item for item in matches}
+        if len(unique_matches) > 1:
+            raise HTTPException(status_code=409, detail="Email dan username SCI-ID terhubung ke akun lokal yang berbeda")
+        linked = next(iter(unique_matches.values()), None)
+    role_claims = oidc_roles(claims, settings["client_id"])
+    synced = {
+        "role": role,
+        "name": name,
+        "sso_issuer": issuer,
+        "sso_subject": subject,
+        "sso_roles": role_claims,
+        "auth_source": "sso",
+        "status": "active",
+        "last_login_at": now_iso(),
+        "sso_synced_at": now_iso(),
+    }
+    employee_id = str(claims.get("employee_id") or claims.get("nidn") or claims.get("nip") or "").strip()
+    nim = str(claims.get("nim") or "").strip()
+    if employee_id:
+        synced["employee_id"] = employee_id
+    if nim:
+        synced["nim"] = nim
+    if linked:
+        await db.users.update_one({"id": linked["id"]}, {"$set": synced})
+        user = await db.users.find_one({"id": linked["id"]}, {"_id": 0})
+    else:
+        candidate = username
+        if await db.users.find_one({"username": candidate}, {"_id": 0, "id": 1}):
+            candidate = f"{candidate}-{subject[:6]}"
+        doc = {
+            "id": new_id(),
+            "username": candidate,
+            "email": email,
+            "whatsapp": str(claims.get("phone_number") or ""),
+            "password_hash": hash_password(secrets.token_urlsafe(32)),
+            "class_ids": [],
+            "created_at": now_iso(),
+            **synced,
+        }
+        await db.users.insert_one(doc)
+        user = doc
+    return public_doc(user)
 
 
 def parse_iso_datetime(value: str) -> Optional[datetime]:
@@ -404,6 +630,7 @@ def identity_query(identifier: str) -> Dict[str, Any]:
     candidates: List[Dict[str, str]] = [
         {"email": lowered},
         {"username": lowered},
+        {"employee_id": raw},
         {"nim": raw.upper()},
         {"nim": raw},
         {"whatsapp": raw},
@@ -805,12 +1032,14 @@ def unique_ids(values: List[str]) -> List[str]:
     return result
 
 
-async def get_manageable_class(class_id: str, active_only: bool = False) -> Dict[str, Any]:
+async def get_manageable_class(class_id: str, active_only: bool = False, user: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     query: Dict[str, Any] = {"id": class_id}
     if active_only:
         query["status"] = "active"
     else:
         query["status"] = {"$ne": "deleted"}
+    if user and user.get("role") == "lecturer":
+        query["lecturer_id"] = user["id"]
     class_doc = await db.classes.find_one(query, {"_id": 0})
     if not class_doc:
         raise HTTPException(status_code=404, detail="Kelas aktif tidak ditemukan" if active_only else "Kelas tidak ditemukan")
@@ -868,6 +1097,8 @@ async def invite_student_to_class_record(
         "class_id": class_doc["id"],
         "class_name": class_doc.get("name", ""),
         "class_code": class_doc.get("class_code", ""),
+        "lecturer_id": class_doc.get("lecturer_id", ""),
+        "lecturer_name": class_doc.get("lecturer_name", ""),
         "student_id": student["id"],
         "student_name": student.get("name", ""),
         "student_nim": student.get("nim", ""),
@@ -1030,6 +1261,8 @@ async def find_user(user_id: str) -> Dict[str, Any]:
     user = await db.users.find_one({"id": user_id}, {"_id": 0})
     if not user:
         raise HTTPException(status_code=401, detail="Sesi tidak valid")
+    if user.get("status", "active") != "active":
+        raise HTTPException(status_code=403, detail="Akun tidak aktif")
     return user
 
 
@@ -1044,9 +1277,52 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[
 
 
 async def require_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    if user.get("role") != "admin":
-        raise HTTPException(status_code=403, detail="Hanya dosen/admin")
+    if user.get("role") not in {"admin", "lecturer"}:
+        raise HTTPException(status_code=403, detail="Hanya dosen atau admin kampus")
     return user
+
+
+async def require_campus_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Hanya admin kampus")
+    return user
+
+
+def is_campus_admin(user: Dict[str, Any]) -> bool:
+    return user.get("role") == "admin"
+
+
+async def lecturer_class_ids(user: Dict[str, Any], include_deleted: bool = False) -> List[str]:
+    if user.get("role") == "student":
+        return list(user.get("class_ids", []))
+    query: Dict[str, Any] = {}
+    if not include_deleted:
+        query["status"] = {"$ne": "deleted"}
+    if not is_campus_admin(user):
+        query["lecturer_id"] = user["id"]
+    docs = await db.classes.find(query, {"_id": 0, "id": 1}).to_list(5000)
+    return [item["id"] for item in docs]
+
+
+async def require_class_access(class_id: str, user: Dict[str, Any], active_only: bool = False) -> Dict[str, Any]:
+    query: Dict[str, Any] = {"id": class_id}
+    query["status"] = "active" if active_only else {"$ne": "deleted"}
+    if user.get("role") == "lecturer":
+        query["lecturer_id"] = user["id"]
+    elif user.get("role") == "student":
+        query["id"] = {"$in": user.get("class_ids", [])}
+    class_doc = await db.classes.find_one(query, {"_id": 0})
+    if not class_doc:
+        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan atau bukan kelas yang Anda kelola")
+    return class_doc
+
+
+async def require_submission_access(submission_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
+    submission = await db.submissions.find_one({"id": submission_id}, {"_id": 0})
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission tidak ditemukan")
+    await require_class_access(submission.get("class_id", ""), user)
+    return submission
 
 
 def chat_conversation_id(first_user_id: str, second_user_id: str) -> str:
@@ -1153,6 +1429,10 @@ class LoginInput(BaseModel):
     password: str = Field(min_length=3)
 
 
+class SsoExchangeInput(BaseModel):
+    ticket: str = Field(min_length=20)
+
+
 class RegisterStudentInput(BaseModel):
     username: str = ""
     nim: str
@@ -1200,7 +1480,7 @@ class ProgramInput(BaseModel):
 
 
 class CourseInput(BaseModel):
-    program_id: str
+    program_id: str = ""
     code: str
     name: str
     credits: int = 3
@@ -1225,6 +1505,25 @@ class StudentInput(BaseModel):
     password: str = "Mahasiswa123!"
 
 
+class LecturerInput(BaseModel):
+    employee_id: str = ""
+    username: str = Field(min_length=3)
+    name: str = Field(min_length=1)
+    email: EmailStr
+    whatsapp: str = ""
+    password: str = Field(default="Dosen123!", min_length=6)
+    status: str = "active"
+
+
+class LecturerUpdateInput(BaseModel):
+    employee_id: str = ""
+    username: str = Field(min_length=3)
+    name: str = Field(min_length=1)
+    email: EmailStr
+    whatsapp: str = ""
+    status: str = "active"
+
+
 class MaterialInput(BaseModel):
     class_id: str
     title: str
@@ -1232,8 +1531,15 @@ class MaterialInput(BaseModel):
     meeting: str = "Pertemuan 1"
     file_url: str = ""
     video_url: str = ""
+    meeting_type: str = "offline"
+    meeting_url: str = ""
     is_active: bool = True
     locked_until: str = ""
+
+
+class GoogleMeetInput(BaseModel):
+    class_id: str
+    title: str = ""
 
 
 class CommentInput(BaseModel):
@@ -1346,8 +1652,22 @@ class GoogleDriveSettingsInput(BaseModel):
     root_folder_id: str = ""
     root_folder_name: str = "E-Learning Dosen"
     require_upload: bool = False
+    lecturer_folder_sharing_enabled: bool = False
+    lecturer_folder_role: str = "reader"
+    google_meet_enabled: bool = False
+    google_workspace_delegated_user: str = ""
     service_account_json: str = ""
     clear_service_account: bool = False
+
+
+class DatabaseBackupSettingsInput(BaseModel):
+    enabled: bool = False
+    frequency: str = "daily"
+    run_time: str = "02:00"
+    weekly_day: int = Field(default=0, ge=0, le=6)
+    retention_count: int = Field(default=14, ge=1, le=90)
+    upload_to_drive: bool = True
+    keep_local: bool = True
 
 
 class WhatsAppSettingsInput(BaseModel):
@@ -1375,6 +1695,19 @@ class EmailSettingsInput(BaseModel):
     smtp_use_tls: bool = True
     from_name: str = "E-Learning Dosen"
     from_email: str = ""
+
+
+class OidcSettingsInput(BaseModel):
+    enabled: bool = True
+    discovery_url: str = ""
+    issuer: str = ""
+    client_id: str = ""
+    client_secret: str = ""
+    redirect_uri: str = ""
+    frontend_url: str = ""
+    scopes: str = "openid profile email roles"
+    local_login_enabled: bool = True
+    clear_client_secret: bool = False
 
 
 async def seed_data() -> None:
@@ -1438,6 +1771,8 @@ async def seed_data() -> None:
             "name": "IF-4A",
             "schedule": "Selasa 09.00",
             "class_code": "WEB4A1",
+            "lecturer_id": admin_id,
+            "lecturer_name": "Dosen Admin",
             "status": "active",
             "student_ids": [student_id],
             "created_at": now_iso(),
@@ -1484,7 +1819,7 @@ async def seed_data() -> None:
             "is_active": True,
             "is_practicum": True,
             "practicum_goal": "Mahasiswa memahami struktur API CRUD.",
-            "practicum_tools": "Python, FastAPI, MongoDB",
+            "practicum_tools": "Python, FastAPI, PostgreSQL",
             "practicum_steps": ["Rancang endpoint", "Uji dengan curl", "Tulis laporan"],
             "required_screenshot": True,
             "late_penalty_per_day": 5,
@@ -1492,6 +1827,7 @@ async def seed_data() -> None:
             "material_id": material_id,
             "created_at": now_iso(),
             "created_by": admin_id,
+            "lecturer_id": admin_id,
         }
     )
     await db.materials.insert_one(
@@ -1507,6 +1843,7 @@ async def seed_data() -> None:
             "locked_until": "",
             "created_at": now_iso(),
             "created_by": admin_id,
+            "lecturer_id": admin_id,
         }
     )
     logger.info("Seed data e-learning dibuat")
@@ -1533,6 +1870,34 @@ async def ensure_program_course_links() -> None:
         linked = await db.programs.find_one({"id": course.get("program_id")}, {"_id": 0})
         if linked:
             await db.courses.update_one({"id": course["id"]}, {"$set": {"program_name": linked.get("name", "")}})
+
+
+async def ensure_multi_lecturer_schema() -> None:
+    """Backfill ownership so existing single-lecturer installations remain usable."""
+    fallback = await db.users.find_one({"role": "admin", "status": {"$ne": "deleted"}}, {"_id": 0})
+    if not fallback:
+        return
+    fallback_id = fallback["id"]
+    fallback_name = fallback.get("name", "Admin Kampus")
+    async for class_doc in db.classes.find(
+        {"$or": [{"lecturer_id": {"$exists": False}}, {"lecturer_id": ""}, {"lecturer_id": None}]},
+        {"_id": 0, "id": 1, "created_by": 1},
+    ):
+        owner_id = class_doc.get("created_by") or fallback_id
+        owner = await db.users.find_one({"id": owner_id, "role": {"$in": ["admin", "lecturer"]}}, {"_id": 0}) or fallback
+        await db.classes.update_one(
+            {"id": class_doc["id"]},
+            {"$set": {"lecturer_id": owner["id"], "lecturer_name": owner.get("name", fallback_name)}},
+        )
+    async for class_doc in db.classes.find({}, {"_id": 0, "id": 1, "lecturer_id": 1, "lecturer_name": 1}):
+        owner_id = class_doc.get("lecturer_id") or fallback_id
+        owner_name = class_doc.get("lecturer_name") or fallback_name
+        class_id = class_doc["id"]
+        for collection in [db.materials, db.assignments, db.submissions, db.enrollment_requests, db.reminder_logs]:
+            await collection.update_many(
+                {"class_id": class_id, "$or": [{"lecturer_id": {"$exists": False}}, {"lecturer_id": ""}, {"lecturer_id": None}]},
+                {"$set": {"lecturer_id": owner_id, "lecturer_name": owner_name}},
+            )
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -1594,8 +1959,63 @@ def decrypt_secret(value: str) -> str:
     try:
         return Fernet(get_drive_config_key()).decrypt(value.encode("utf-8")).decode("utf-8")
     except InvalidToken:
-        logger.error("Kunci enkripsi Google Drive tidak cocok dengan credential tersimpan")
+        logger.error("Kunci enkripsi aplikasi tidak cocok dengan credential tersimpan")
         return ""
+
+
+def validate_oidc_url(value: str, label: str, required: bool = True) -> str:
+    normalized = (value or "").strip().rstrip("/")
+    if not normalized and not required:
+        return ""
+    parsed = urlsplit(normalized)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail=f"{label} harus berupa URL HTTP/HTTPS yang valid")
+    host = (parsed.hostname or "").lower()
+    local_http = host in {"localhost", "127.0.0.1", "::1"} or host.startswith(("10.", "192.168."))
+    if parsed.scheme != "https" and not local_http:
+        raise HTTPException(status_code=400, detail=f"{label} non-local wajib menggunakan HTTPS")
+    return normalized
+
+
+def oidc_admin_view(settings: Dict[str, Any], source: str = "environment", metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    secret_configured = bool(settings.get("client_secret"))
+    return {
+        "enabled": bool(settings.get("enabled")),
+        "provider": "SCI-ID",
+        "discovery_url": settings.get("discovery_url", ""),
+        "issuer": settings.get("issuer", ""),
+        "client_id": settings.get("client_id", ""),
+        "client_secret_configured": secret_configured,
+        "client_secret_masked": "••••••••••••" if secret_configured else "",
+        "redirect_uri": settings.get("redirect_uri", ""),
+        "frontend_url": settings.get("frontend_url", ""),
+        "scopes": settings.get("scopes", "openid profile email roles"),
+        "local_login_enabled": bool(settings.get("local_login_enabled", True)),
+        "source": source,
+        "updated_at": (metadata or {}).get("updated_at", ""),
+        "updated_by": (metadata or {}).get("updated_by", ""),
+    }
+
+
+async def load_oidc_runtime_settings() -> Dict[str, Any]:
+    doc = await db.oidc_settings.find_one({"id": "main"}, {"_id": 0}) or {}
+    _oidc_runtime_settings.clear()
+    if doc:
+        _oidc_runtime_settings.update(
+            {
+                "enabled": bool(doc.get("enabled")),
+                "discovery_url": str(doc.get("discovery_url", "")).strip(),
+                "issuer": str(doc.get("issuer", "")).strip().rstrip("/"),
+                "client_id": str(doc.get("client_id", "")).strip(),
+                "client_secret": decrypt_secret(str(doc.get("client_secret_encrypted", ""))),
+                "redirect_uri": str(doc.get("redirect_uri", "")).strip(),
+                "frontend_url": str(doc.get("frontend_url", "")).strip().rstrip("/"),
+                "scopes": str(doc.get("scopes", "openid profile email roles")).strip(),
+                "local_login_enabled": bool(doc.get("local_login_enabled", True)),
+            }
+        )
+    clear_oidc_discovery_cache()
+    return oidc_admin_view(oidc_settings(), "admin_ui" if doc else "environment", doc)
 
 
 def normalize_service_account_payload(value: str) -> Dict[str, Any]:
@@ -1633,12 +2053,22 @@ async def get_google_drive_settings(mask: bool = True) -> Dict[str, Any]:
         "root_folder_id": doc.get("root_folder_id", os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID", "")),
         "root_folder_name": safe_path_segment(doc.get("root_folder_name", os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_NAME", "E-Learning Dosen"))),
         "require_upload": bool(doc.get("require_upload", env_flag("GOOGLE_DRIVE_REQUIRE_UPLOAD", False))),
+        "lecturer_folder_sharing_enabled": bool(doc.get("lecturer_folder_sharing_enabled", False)),
+        "lecturer_folder_role": doc.get("lecturer_folder_role", "reader") if doc.get("lecturer_folder_role") in {"reader", "writer"} else "reader",
+        "google_meet_enabled": bool(doc.get("google_meet_enabled", env_enabled("GOOGLE_MEET_ENABLED", False))),
+        "google_workspace_delegated_user": str(doc.get("google_workspace_delegated_user") or os.environ.get("GOOGLE_WORKSPACE_DELEGATED_USER", "")).strip().lower(),
         "service_account_configured": bool(credential or env_has_credential),
         "service_account_source": credential_source,
         "service_account_email": service_account_email,
         "updated_at": doc.get("updated_at", ""),
         "updated_by": doc.get("updated_by", ""),
     }
+    settings["google_meet_ready"] = bool(
+        settings["google_meet_enabled"]
+        and settings["service_account_configured"]
+        and settings["google_workspace_delegated_user"]
+    )
+    settings["google_meet_scope"] = "https://www.googleapis.com/auth/meetings.space.created"
     if not mask:
         settings["service_account_json"] = credential
     _set_cached_settings("google_drive_settings", settings)
@@ -1730,6 +2160,302 @@ def get_drive_service(settings: Optional[Dict[str, Any]] = None):
     return build("drive", "v3", credentials=credentials, cache_discovery=False)
 
 
+BACKUP_ROOT = STORAGE_ROOT / "Database Backups"
+BACKUP_TIMEZONE = ZoneInfo(os.environ.get("BACKUP_TIMEZONE", "Asia/Jakarta"))
+_database_backup_scheduler_task: Optional[asyncio.Task] = None
+
+
+def default_database_backup_settings() -> Dict[str, Any]:
+    return {
+        "id": "main",
+        "enabled": False,
+        "frequency": "daily",
+        "run_time": "02:00",
+        "weekly_day": 0,
+        "retention_count": 14,
+        "upload_to_drive": True,
+        "keep_local": True,
+        "timezone": str(BACKUP_TIMEZONE),
+    }
+
+
+async def get_database_backup_settings() -> Dict[str, Any]:
+    doc = await db.database_backup_settings.find_one({"id": "main"}, {"_id": 0}) or {}
+    return {**default_database_backup_settings(), **doc, "running": bool(doc.get("running"))}
+
+
+def next_database_backup_at(settings: Dict[str, Any], after: Optional[datetime] = None) -> str:
+    current = (after or datetime.now(timezone.utc)).astimezone(BACKUP_TIMEZONE)
+    try:
+        hour, minute = [int(item) for item in str(settings.get("run_time", "02:00")).split(":", 1)]
+    except (TypeError, ValueError):
+        hour, minute = 2, 0
+    candidate = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if settings.get("frequency") == "weekly":
+        target_day = int(settings.get("weekly_day", 0))
+        candidate += timedelta(days=(target_day - candidate.weekday()) % 7)
+        if candidate <= current:
+            candidate += timedelta(days=7)
+    elif candidate <= current:
+        candidate += timedelta(days=1)
+    return candidate.astimezone(timezone.utc).isoformat()
+
+
+async def database_backup_payload() -> bytes:
+    collection_names = sorted(
+        name for name in await db.list_collection_names() if not name.startswith("system.")
+    )
+    collections: Dict[str, List[Dict[str, Any]]] = {}
+    for name in collection_names:
+        documents: List[Dict[str, Any]] = []
+        async for document in db[name].find({}):
+            documents.append(document)
+        collections[name] = documents
+    payload = {
+        "format": "nugaslagi-postgresql-jsonb",
+        "version": 2,
+        "database": db.name,
+        "created_at": now_iso(),
+        "collections": collections,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return gzip.compress(raw, compresslevel=6)
+
+
+def upload_database_backup_to_drive_sync(
+    content: bytes, file_name: str, settings: Dict[str, Any]
+) -> Dict[str, str]:
+    service = get_drive_service(settings)
+    root_folder_id = settings.get("root_folder_id", "")
+    if not root_folder_id:
+        root_folder_id = drive_find_or_create_folder(
+            service,
+            safe_path_segment(settings.get("root_folder_name") or "E-Learning Dosen"),
+            None,
+        )
+    backup_folder_id = drive_find_or_create_folder(
+        service, "Database Backups", root_folder_id
+    )
+    media = MediaIoBaseUpload(
+        io.BytesIO(content), mimetype="application/gzip", resumable=True
+    )
+    uploaded = (
+        service.files()
+        .create(
+            body={"name": file_name, "parents": [backup_folder_id]},
+            media_body=media,
+            fields="id,name,webViewLink",
+            supportsAllDrives=True,
+        )
+        .execute()
+    )
+    return {
+        "drive_file_id": uploaded.get("id", ""),
+        "drive_file_url": uploaded.get("webViewLink", ""),
+    }
+
+
+def delete_database_backup_from_drive_sync(file_id: str, settings: Dict[str, Any]) -> None:
+    if file_id:
+        get_drive_service(settings).files().delete(
+            fileId=file_id, supportsAllDrives=True
+        ).execute()
+
+
+async def enforce_database_backup_retention(settings: Dict[str, Any]) -> None:
+    retention = max(1, int(settings.get("retention_count", 14)))
+    expired = await db.database_backups.find(
+        {"status": {"$in": ["completed", "completed_with_warning"]}}, {"_id": 0}
+    ).sort("created_at", -1).skip(retention).to_list(500)
+    drive_settings = await get_google_drive_settings(mask=False)
+    for item in expired:
+        local_path = item.get("local_path", "")
+        if local_path:
+            path = Path(local_path)
+            if path.exists() and BACKUP_ROOT.resolve() in path.resolve().parents:
+                path.unlink(missing_ok=True)
+        if item.get("drive_file_id") and google_drive_upload_enabled(drive_settings):
+            try:
+                await asyncio.to_thread(
+                    delete_database_backup_from_drive_sync,
+                    item["drive_file_id"],
+                    drive_settings,
+                )
+            except Exception as exc:
+                logger.warning("Backup lama gagal dihapus dari Drive: %s", exc)
+        await db.database_backups.delete_one({"id": item["id"]})
+
+
+async def create_database_backup(trigger: str, user_id: str = "system") -> Dict[str, Any]:
+    backup_id = str(uuid.uuid4())
+    created_at = now_iso()
+    file_name = f"nugaslagi-db-{datetime.now(BACKUP_TIMEZONE).strftime('%Y%m%d-%H%M%S')}.json.gz"
+    record = {
+        "id": backup_id,
+        "file_name": file_name,
+        "trigger": trigger,
+        "status": "running",
+        "created_at": created_at,
+        "created_by": user_id,
+        "size": 0,
+        "local_available": False,
+        "drive_file_id": "",
+        "drive_file_url": "",
+        "error": "",
+    }
+    await db.database_backups.insert_one(record.copy())
+    settings = await get_database_backup_settings()
+    try:
+        content = await database_backup_payload()
+        BACKUP_ROOT.mkdir(parents=True, exist_ok=True)
+        local_path = BACKUP_ROOT / file_name
+        local_path.write_bytes(content)
+        update: Dict[str, Any] = {
+            "status": "completed",
+            "completed_at": now_iso(),
+            "size": len(content),
+            "local_path": str(local_path),
+            "local_available": True,
+        }
+        if settings.get("upload_to_drive"):
+            drive_settings = await get_google_drive_settings(mask=False)
+            if not google_drive_upload_enabled(drive_settings):
+                update.update(
+                    status="completed_with_warning",
+                    error="Backup lokal berhasil, tetapi Google Drive belum aktif atau belum dikonfigurasi.",
+                )
+            else:
+                try:
+                    drive_result = await asyncio.to_thread(
+                        upload_database_backup_to_drive_sync,
+                        content,
+                        file_name,
+                        drive_settings,
+                    )
+                    update.update(drive_result)
+                except Exception as exc:
+                    update.update(
+                        status="completed_with_warning",
+                        error=f"Backup lokal berhasil, upload Drive gagal: {google_drive_error_message(exc)}",
+                    )
+        if not settings.get("keep_local") and update.get("drive_file_id"):
+            local_path.unlink(missing_ok=True)
+            update.update(local_path="", local_available=False)
+        await db.database_backups.update_one({"id": backup_id}, {"$set": update})
+        await enforce_database_backup_retention(settings)
+    except Exception as exc:
+        logger.exception("Backup database gagal: %s", exc)
+        await db.database_backups.update_one(
+            {"id": backup_id},
+            {"$set": {"status": "failed", "completed_at": now_iso(), "error": str(exc)[:500]}},
+        )
+    return await db.database_backups.find_one({"id": backup_id}, {"_id": 0})
+
+
+async def database_backup_scheduler() -> None:
+    while True:
+        try:
+            settings = await get_database_backup_settings()
+            if settings.get("enabled"):
+                now = now_iso()
+                next_run = settings.get("next_run_at") or next_database_backup_at(settings)
+                if not settings.get("next_run_at"):
+                    await db.database_backup_settings.update_one(
+                        {"id": "main"}, {"$set": {"next_run_at": next_run}}, upsert=True
+                    )
+                if next_run <= now:
+                    lock_until = (datetime.now(timezone.utc) + timedelta(minutes=30)).isoformat()
+                    claimed = await db.database_backup_settings.update_one(
+                        {
+                            "id": "main",
+                            "enabled": True,
+                            "next_run_at": {"$lte": now},
+                            "$or": [
+                                {"auto_lock_until": {"$exists": False}},
+                                {"auto_lock_until": {"$lt": now}},
+                            ],
+                        },
+                        {"$set": {"running": True, "auto_lock_until": lock_until}},
+                    )
+                    if claimed.modified_count:
+                        await create_database_backup("automatic", "system")
+                        latest = await get_database_backup_settings()
+                        await db.database_backup_settings.update_one(
+                            {"id": "main"},
+                            {"$set": {
+                                "running": False,
+                                "last_run_at": now_iso(),
+                                "next_run_at": next_database_backup_at(latest),
+                            }, "$unset": {"auto_lock_until": ""}},
+                        )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Scheduler backup database bermasalah: %s", exc)
+        await asyncio.sleep(60)
+
+
+def get_meet_access_token(settings: Dict[str, Any], delegated_user: str = "") -> str:
+    """Get a user-authorized token for Meet using Workspace domain-wide delegation."""
+    credential_payload = settings.get("service_account_json", "")
+    scopes = ["https://www.googleapis.com/auth/meetings.space.created"]
+    if credential_payload:
+        credentials = service_account.Credentials.from_service_account_info(
+            json.loads(credential_payload), scopes=scopes
+        )
+    else:
+        json_payload = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+        json_payload_b64 = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON_B64")
+        file_path = os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE")
+        if json_payload:
+            credentials = service_account.Credentials.from_service_account_info(json.loads(json_payload), scopes=scopes)
+        elif json_payload_b64:
+            credentials = service_account.Credentials.from_service_account_info(
+                json.loads(base64.b64decode(json_payload_b64).decode("utf-8")), scopes=scopes
+            )
+        elif file_path:
+            credentials = service_account.Credentials.from_service_account_file(file_path, scopes=scopes)
+        else:
+            raise RuntimeError("Service account Google belum dikonfigurasi")
+    effective_user = str(delegated_user or settings.get("google_workspace_delegated_user", "")).strip()
+    if effective_user:
+        credentials = credentials.with_subject(effective_user)
+    credentials.refresh(GoogleAuthRequest())
+    if not credentials.token:
+        raise RuntimeError("Token Google Meet tidak berhasil dibuat")
+    return credentials.token
+
+
+def create_google_meet_space_sync(settings: Dict[str, Any], delegated_user: str = "") -> Dict[str, str]:
+    if not settings.get("service_account_configured"):
+        raise RuntimeError("Service account Google belum dikonfigurasi")
+    effective_user = str(delegated_user or settings.get("google_workspace_delegated_user", "")).strip()
+    if not effective_user:
+        raise RuntimeError(
+            "Isi Google Workspace user untuk Meet dan aktifkan Domain-wide Delegation pada service account"
+        )
+    token = get_meet_access_token(settings, effective_user)
+    response = httpx.post(
+        "https://meet.googleapis.com/v2/spaces",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={},
+        timeout=20,
+    )
+    if response.status_code >= 400:
+        detail = ""
+        try:
+            detail = response.json().get("error", {}).get("message", "")
+        except ValueError:
+            detail = response.text
+        raise RuntimeError(f"Google Meet menolak pembuatan ruang: {detail[:400]}")
+    payload = response.json()
+    meeting_uri = str(payload.get("meetingUri", "")).strip()
+    meeting_code = str(payload.get("meetingCode", "")).strip()
+    if not meeting_uri:
+        raise RuntimeError("Google Meet tidak mengembalikan link pertemuan")
+    return {"meeting_url": meeting_uri, "meeting_code": meeting_code, "meeting_space_name": str(payload.get("name", ""))}
+
+
 def drive_query_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -1765,17 +2491,181 @@ def drive_find_or_create_folder(service, name: str, parent_id: Optional[str]) ->
     return folder["id"]
 
 
-def upload_to_drive(temp_path: str, filename: str, mime_type: str, hierarchy: List[str], settings: Dict[str, Any]) -> Dict[str, Any]:
+def lecturer_drive_folder_name(lecturer: Dict[str, Any]) -> str:
+    existing_name = str(lecturer.get("drive_folder_name", "")).strip()
+    if existing_name:
+        return safe_path_segment(existing_name)
+    lecturer_code = str(lecturer.get("employee_id") or lecturer.get("id") or "DOSEN").strip()
+    lecturer_name = str(lecturer.get("name") or "Dosen").strip()
+    return safe_path_segment(f"{lecturer_code} - {lecturer_name}")
+
+
+def drive_ensure_user_permission(service, folder_id: str, email: str, role: str) -> Dict[str, str]:
+    clean_email = (email or "").strip().lower()
+    clean_role = role if role in {"reader", "writer"} else "reader"
+    if not clean_email:
+        return {"drive_access_status": "missing_email", "drive_permission_id": ""}
+    permissions = (
+        service.permissions()
+        .list(
+            fileId=folder_id,
+            fields="permissions(id,type,emailAddress,role)",
+            supportsAllDrives=True,
+        )
+        .execute()
+        .get("permissions", [])
+    )
+    existing = next(
+        (
+            item
+            for item in permissions
+            if item.get("type") == "user" and str(item.get("emailAddress", "")).lower() == clean_email
+        ),
+        None,
+    )
+    if existing:
+        permission_id = existing.get("id", "")
+        if existing.get("role") != clean_role:
+            service.permissions().update(
+                fileId=folder_id,
+                permissionId=permission_id,
+                body={"role": clean_role},
+                supportsAllDrives=True,
+            ).execute()
+    else:
+        created = (
+            service.permissions()
+            .create(
+                fileId=folder_id,
+                body={"type": "user", "role": clean_role, "emailAddress": clean_email},
+                fields="id",
+                sendNotificationEmail=False,
+                supportsAllDrives=True,
+            )
+            .execute()
+        )
+        permission_id = created.get("id", "")
+    return {
+        "drive_access_status": "shared",
+        "drive_permission_id": permission_id,
+        "drive_permission_email": clean_email,
+        "drive_permission_role": clean_role,
+    }
+
+
+def drive_revoke_user_permission(service, folder_id: str, permission_id: str) -> None:
+    if folder_id and permission_id:
+        service.permissions().delete(
+            fileId=folder_id,
+            permissionId=permission_id,
+            supportsAllDrives=True,
+        ).execute()
+
+
+def drive_prepare_lecturer_folder(
+    settings: Dict[str, Any], lecturer: Dict[str, Any]
+) -> Dict[str, str]:
+    service = get_drive_service(settings)
+    root_folder_name = safe_path_segment(settings.get("root_folder_name") or "E-Learning Dosen")
+    root_folder_id = settings.get("root_folder_id") or os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID")
+    if not root_folder_id:
+        root_folder_id = drive_find_or_create_folder(service, root_folder_name, None)
+    lecturers_folder_id = drive_find_or_create_folder(service, "Dosen", root_folder_id)
+    folder_name = lecturer_drive_folder_name(lecturer)
+    folder_id = drive_find_or_create_folder(service, folder_name, lecturers_folder_id)
+    result = {
+        "drive_folder_id": folder_id,
+        "drive_folder_name": folder_name,
+        "drive_access_status": "app_only",
+        "drive_permission_id": "",
+        "drive_permission_email": "",
+        "drive_permission_role": "",
+        "drive_access_error": "",
+    }
+    if settings.get("lecturer_folder_sharing_enabled") and lecturer.get("status", "active") == "active":
+        try:
+            result.update(
+                drive_ensure_user_permission(
+                    service,
+                    folder_id,
+                    lecturer.get("email", ""),
+                    settings.get("lecturer_folder_role", "reader"),
+                )
+            )
+        except Exception as exc:
+            result.update(
+                {
+                    "drive_access_status": "share_failed",
+                    "drive_access_error": google_drive_error_message(exc),
+                }
+            )
+    return result
+
+
+async def reconcile_lecturer_drive_access(lecturer_id: str) -> None:
+    lecturer = await db.users.find_one({"id": lecturer_id, "role": "lecturer"}, {"_id": 0})
+    if not lecturer:
+        return
+    settings = await get_google_drive_settings(mask=False)
+    if not google_drive_upload_enabled(settings):
+        return
+    old_folder_id = str(lecturer.get("drive_folder_id", ""))
+    old_permission_id = str(lecturer.get("drive_permission_id", ""))
+    should_share = bool(
+        settings.get("lecturer_folder_sharing_enabled") and lecturer.get("status", "active") == "active"
+    )
+    if old_folder_id and old_permission_id and not should_share:
+        try:
+            await asyncio.to_thread(
+                drive_revoke_user_permission,
+                get_drive_service(settings),
+                old_folder_id,
+                old_permission_id,
+            )
+        except Exception as exc:
+            logger.warning("Gagal mencabut akses Drive dosen %s: %s", lecturer_id, exc)
+    try:
+        drive_doc = await asyncio.to_thread(drive_prepare_lecturer_folder, settings, lecturer)
+    except Exception as exc:
+        logger.exception("Gagal menyiapkan folder Drive dosen %s: %s", lecturer_id, exc)
+        await db.users.update_one(
+            {"id": lecturer_id},
+            {"$set": {"drive_access_status": "provision_failed", "drive_access_error": google_drive_error_message(exc)}},
+        )
+        return
+    await db.users.update_one(
+        {"id": lecturer_id},
+        {"$set": {**drive_doc, "drive_access_updated_at": now_iso()}},
+    )
+
+
+async def reconcile_all_lecturer_drive_access() -> None:
+    lecturer_ids = await db.users.distinct("id", {"role": "lecturer", "status": {"$ne": "deleted"}})
+    for lecturer_id in lecturer_ids:
+        await reconcile_lecturer_drive_access(str(lecturer_id))
+
+
+def upload_to_drive(
+    temp_path: str,
+    filename: str,
+    mime_type: str,
+    hierarchy: List[str],
+    settings: Dict[str, Any],
+    lecturer_email: str = "",
+) -> Dict[str, Any]:
     service = get_drive_service(settings)
     root_folder_name = safe_path_segment(settings.get("root_folder_name") or "E-Learning Dosen")
     parent_id = settings.get("root_folder_id") or os.environ.get("GOOGLE_DRIVE_ROOT_FOLDER_ID")
     path_parts = [root_folder_name]
     if not parent_id:
         parent_id = drive_find_or_create_folder(service, root_folder_name, None)
-    for folder_name in hierarchy:
+    lecturer_folder_id = ""
+    for folder_index, folder_name in enumerate(hierarchy):
         clean_folder_name = safe_path_segment(folder_name or "Tanpa Nama")
         parent_id = drive_find_or_create_folder(service, clean_folder_name, parent_id)
         path_parts.append(clean_folder_name)
+        if folder_index == 1 and hierarchy[0] == "Dosen":
+            lecturer_folder_id = parent_id
     media = MediaFileUpload(temp_path, mimetype=mime_type or "application/octet-stream", resumable=True)
     metadata = {"name": safe_path_segment(filename), "parents": [parent_id]}
     uploaded = (
@@ -1788,7 +2678,7 @@ def upload_to_drive(temp_path: str, filename: str, mime_type: str, hierarchy: Li
         )
         .execute()
     )
-    return {
+    result = {
         "drive_file_id": uploaded.get("id", ""),
         "drive_file_name": uploaded.get("name", filename),
         "drive_file_url": uploaded.get("webViewLink", ""),
@@ -1797,6 +2687,35 @@ def upload_to_drive(temp_path: str, filename: str, mime_type: str, hierarchy: Li
         "drive_folder_path": str(Path(*path_parts)),
         "drive_uploaded_at": now_iso(),
     }
+    if lecturer_folder_id:
+        result.update(
+            {
+                "drive_lecturer_folder_id": lecturer_folder_id,
+                "drive_access_status": "app_only",
+                "drive_permission_id": "",
+                "drive_permission_email": "",
+                "drive_permission_role": "",
+                "drive_access_error": "",
+            }
+        )
+        if settings.get("lecturer_folder_sharing_enabled"):
+            try:
+                result.update(
+                    drive_ensure_user_permission(
+                        service,
+                        lecturer_folder_id,
+                        lecturer_email,
+                        settings.get("lecturer_folder_role", "reader"),
+                    )
+                )
+            except Exception as exc:
+                result.update(
+                    {
+                        "drive_access_status": "share_failed",
+                        "drive_access_error": google_drive_error_message(exc),
+                    }
+                )
+    return result
 
 
 async def refresh_embedded_file_references(file_id: str) -> None:
@@ -1855,6 +2774,7 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
             file_doc.get("mime_type") or "application/octet-stream",
             file_doc.get("drive_hierarchy") or [],
             settings,
+            file_doc.get("lecturer_email", ""),
         )
         await db.stored_files.update_one(
             {"id": file_id},
@@ -1869,6 +2789,22 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
                 "$unset": {"drive_error": ""},
             },
         )
+        if file_doc.get("lecturer_id") and drive_doc.get("drive_lecturer_folder_id"):
+            await db.users.update_one(
+                {"id": file_doc["lecturer_id"], "role": "lecturer"},
+                {
+                    "$set": {
+                        "drive_folder_id": drive_doc.get("drive_lecturer_folder_id", ""),
+                        "drive_folder_name": file_doc.get("lecturer_folder_name", ""),
+                        "drive_access_status": drive_doc.get("drive_access_status", "app_only"),
+                        "drive_permission_id": drive_doc.get("drive_permission_id", ""),
+                        "drive_permission_email": drive_doc.get("drive_permission_email", ""),
+                        "drive_permission_role": drive_doc.get("drive_permission_role", ""),
+                        "drive_access_error": drive_doc.get("drive_access_error", ""),
+                        "drive_access_updated_at": now_iso(),
+                    }
+                },
+            )
         await refresh_embedded_file_references(file_id)
     except Exception as exc:
         logger.exception("Sinkron Google Drive background gagal untuk %s: %s", file_doc.get("file_name", file_id), exc)
@@ -1899,6 +2835,7 @@ async def save_uploaded_file_record(
     sync_drive: bool = True,
     background_tasks: Optional[BackgroundTasks] = None,
     async_drive: bool = False,
+    lecturer_id: str = "",
 ) -> Dict[str, Any]:
     drive_settings = await get_google_drive_settings(mask=False) if sync_drive else {}
     if sync_drive and google_drive_upload_required(drive_settings) and not google_drive_upload_enabled(drive_settings):
@@ -1907,11 +2844,20 @@ async def save_uploaded_file_record(
             detail="Google Drive belum dikonfigurasi. Isi konfigurasi Google Drive di menu admin terlebih dahulu.",
         )
 
+    lecturer = {}
+    if lecturer_id:
+        lecturer = await db.users.find_one(
+            {"id": lecturer_id, "role": "lecturer", "status": {"$ne": "deleted"}},
+            {"_id": 0, "id": 1, "employee_id": 1, "name": 1, "email": 1, "drive_folder_name": 1},
+        ) or {}
+    lecturer_folder = lecturer_drive_folder_name(lecturer) if lecturer else ""
+    scoped_hierarchy = ["Dosen", lecturer_folder, *hierarchy] if lecturer_folder else list(hierarchy)
+
     file_id = new_id()
     original_filename = upload.filename or "upload.bin"
     mime_type = upload.content_type or "application/octet-stream"
     local_path, folder_path, storage_path = build_local_file_path(
-        hierarchy,
+        scoped_hierarchy,
         owner_code,
         owner_name,
         file_id,
@@ -1928,7 +2874,7 @@ async def save_uploaded_file_record(
             output.write(chunk)
     await upload.close()
     owner_folder = safe_path_segment(f"{owner_code or 'NO-ID'} - {owner_name}")
-    drive_hierarchy = [*hierarchy, owner_folder]
+    drive_hierarchy = [*scoped_hierarchy, owner_folder]
     file_doc = {
         "id": file_id,
         "file_name": original_filename,
@@ -1945,6 +2891,11 @@ async def save_uploaded_file_record(
         "submission_id": submission_id,
         "assignment_id": assignment_id,
         "record_type": record_type,
+        "lecturer_id": lecturer.get("id", lecturer_id),
+        "lecturer_name": lecturer.get("name", ""),
+        "lecturer_code": lecturer.get("employee_id", ""),
+        "lecturer_email": lecturer.get("email", ""),
+        "lecturer_folder_name": lecturer_folder,
         "upload_status": "stored_on_server",
         "drive_sync_status": "not_configured",
         "drive_hierarchy": drive_hierarchy,
@@ -1964,6 +2915,7 @@ async def save_uploaded_file_record(
                 mime_type,
                 drive_hierarchy,
                 drive_settings,
+                lecturer.get("email", ""),
             )
             file_doc.update(
                 {
@@ -2092,22 +3044,200 @@ async def material_meeting_label_map(class_ids: Optional[List[str]] = None) -> D
     return labels
 
 
+def normalized_material_payload(payload: MaterialInput) -> Dict[str, Any]:
+    doc = payload.model_dump()
+    meeting_type = str(doc.get("meeting_type") or "offline").strip().lower()
+    if meeting_type not in {"offline", "online"}:
+        raise HTTPException(status_code=400, detail="Metode pertemuan harus offline atau online")
+    meeting_url = str(doc.get("meeting_url") or "").strip()
+    if meeting_url and not re.fullmatch(r"https://meet\.google\.com/[a-z0-9-]+", meeting_url, re.IGNORECASE):
+        raise HTTPException(status_code=400, detail="Link Google Meet tidak valid")
+    doc["meeting_type"] = meeting_type
+    doc["meeting_url"] = meeting_url if meeting_type == "online" else ""
+    return doc
+
+
 @api_router.get("/")
 async def root():
     return {
         "message": "E-Learning Dosen API aktif",
+        "version": version_payload(),
         **await storage_status_summary(),
     }
 
 
+@api_router.get("/version")
+async def app_version():
+    schema_versions: list[str] = []
+    try:
+        rows = await db.pool.fetch("SELECT version FROM app_schema_migrations ORDER BY version")
+        schema_versions = [str(row["version"]) for row in rows]
+    except Exception:
+        # Version information should stay available while the database is starting.
+        schema_versions = []
+    return version_payload(schema_versions=schema_versions)
+
+
+@api_router.get("/auth/sso/config")
+async def sso_config():
+    settings = oidc_settings()
+    login_url = ""
+    if settings["enabled"] and settings["redirect_uri"]:
+        callback = urlsplit(settings["redirect_uri"])
+        login_url = f"{callback.scheme}://{callback.netloc}/api/auth/sso/login"
+    return {
+        "enabled": bool(settings["enabled"]),
+        "provider": "SCI-ID",
+        "login_url": login_url,
+        "local_login_enabled": bool(settings["local_login_enabled"]),
+    }
+
+
+@api_router.get("/auth/sso/login")
+async def sso_login():
+    settings = oidc_require_settings()
+    metadata = await oidc_discovery()
+    state = secrets.token_urlsafe(48)
+    nonce = secrets.token_urlsafe(48)
+    verifier = secrets.token_urlsafe(64)
+    challenge = base64url_encode(hashlib.sha256(verifier.encode("ascii")).digest())
+    await db.oidc_flows.insert_one(
+        {
+            "id": new_id(),
+            "state_hash": hashlib.sha256(state.encode("utf-8")).hexdigest(),
+            "nonce": nonce,
+            "code_verifier": verifier,
+            "created_at": now_iso(),
+            "expires_at": datetime.now(timezone.utc) + timedelta(minutes=5),
+        }
+    )
+    query = urlencode(
+        {
+            "client_id": settings["client_id"],
+            "redirect_uri": settings["redirect_uri"],
+            "response_type": "code",
+            "scope": settings["scopes"],
+            "state": state,
+            "nonce": nonce,
+            "code_challenge": challenge,
+            "code_challenge_method": "S256",
+        }
+    )
+    return RedirectResponse(f"{metadata['authorization_endpoint']}?{query}", status_code=307)
+
+
+@api_router.get("/auth/sso/callback")
+async def sso_callback(
+    code: str = "",
+    state: str = "",
+    error: str = "",
+    error_description: str = "",
+):
+    try:
+        oidc_require_settings()
+        if not state:
+            raise HTTPException(status_code=400, detail="State login SCI-ID tidak tersedia")
+        flow = await db.oidc_flows.find_one_and_delete(
+            {"state_hash": hashlib.sha256(state.encode("utf-8")).hexdigest()},
+            {"_id": 0},
+        )
+        if not flow:
+            raise HTTPException(status_code=400, detail="State login SCI-ID tidak valid atau sudah digunakan")
+        expires_at = flow.get("expires_at")
+        if isinstance(expires_at, datetime):
+            expires_at = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
+            if expires_at <= datetime.now(timezone.utc):
+                raise HTTPException(status_code=400, detail="Permintaan login SCI-ID sudah kedaluwarsa")
+        if error:
+            raise HTTPException(status_code=401, detail=error_description or f"SCI-ID menolak login: {error}")
+        if not code:
+            raise HTTPException(status_code=400, detail="Authorization code SCI-ID tidak tersedia")
+        settings = oidc_require_settings()
+        metadata = await oidc_discovery()
+        token_payload = {
+            "grant_type": "authorization_code",
+            "client_id": settings["client_id"],
+            "redirect_uri": settings["redirect_uri"],
+            "code": code,
+            "code_verifier": flow["code_verifier"],
+        }
+        if settings["client_secret"]:
+            token_payload["client_secret"] = settings["client_secret"]
+        try:
+            async with httpx.AsyncClient(timeout=10) as http:
+                token_response = await http.post(
+                    metadata["token_endpoint"],
+                    data=token_payload,
+                    headers={"Accept": "application/json"},
+                )
+                token_response.raise_for_status()
+                token_data = token_response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            logger.warning("Penukaran authorization code SCI-ID gagal: %s", type(exc).__name__)
+            raise HTTPException(status_code=401, detail="Authorization code SCI-ID tidak dapat ditukar") from exc
+        id_token = token_data.get("id_token") if isinstance(token_data, dict) else None
+        if not isinstance(id_token, str) or not id_token:
+            raise HTTPException(status_code=401, detail="SCI-ID tidak mengembalikan ID token")
+        claims = await validate_oidc_id_token(id_token, metadata, flow["nonce"])
+        user = await provision_oidc_user(claims)
+        ticket = secrets.token_urlsafe(48)
+        await db.oidc_login_tickets.insert_one(
+            {
+                "ticket_hash": hashlib.sha256(ticket.encode("utf-8")).hexdigest(),
+                "user_id": user["id"],
+                "sso_subject": claims["sub"],
+                "created_at": now_iso(),
+                "expires_at": datetime.now(timezone.utc) + timedelta(minutes=1),
+            }
+        )
+        return RedirectResponse(oidc_frontend_redirect(sso_ticket=ticket), status_code=303)
+    except HTTPException as exc:
+        logger.warning("Callback SCI-ID ditolak: %s", exc.detail)
+        return RedirectResponse(oidc_frontend_redirect(sso_error=str(exc.detail)), status_code=303)
+    except Exception:
+        logger.exception("Callback SCI-ID gagal")
+        return RedirectResponse(oidc_frontend_redirect(sso_error="Login SCI-ID gagal diproses"), status_code=303)
+
+
+@api_router.post("/auth/sso/exchange")
+async def sso_exchange(payload: SsoExchangeInput):
+    ticket = await db.oidc_login_tickets.find_one_and_delete(
+        {"ticket_hash": hashlib.sha256(payload.ticket.encode("utf-8")).hexdigest()},
+        {"_id": 0},
+    )
+    if not ticket:
+        raise HTTPException(status_code=401, detail="Tiket login SCI-ID tidak valid atau sudah digunakan")
+    expires_at = ticket.get("expires_at")
+    if isinstance(expires_at, datetime):
+        expires_at = expires_at.replace(tzinfo=timezone.utc) if expires_at.tzinfo is None else expires_at.astimezone(timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(status_code=401, detail="Tiket login SCI-ID sudah kedaluwarsa")
+    user = await find_user(ticket["user_id"])
+    token = new_id() + new_id()
+    await db.sessions.insert_one(
+        {
+            "token": token,
+            "user_id": user["id"],
+            "auth_source": "sso",
+            "sso_subject": ticket.get("sso_subject", ""),
+            "created_at": now_iso(),
+        }
+    )
+    return {"token": token, "user": public_doc(user)}
+
+
 @api_router.post("/auth/login")
 async def login(payload: LoginInput):
+    if not oidc_settings()["local_login_enabled"]:
+        raise HTTPException(status_code=403, detail="Login lokal dinonaktifkan. Gunakan SCI-ID.")
     identifier = (payload.identifier or payload.email or "").strip().lower()
     if not identifier:
         raise HTTPException(status_code=400, detail="Username, NIM, nomor HP, atau email diperlukan")
     user = await db.users.find_one(identity_query(identifier), {"_id": 0})
-    if not user or not verify_password(payload.password, user["password_hash"]):
+    if not user or not user.get("password_hash") or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Identitas login atau password salah")
+    if user.get("status", "active") != "active":
+        raise HTTPException(status_code=403, detail="Akun tidak aktif. Hubungi admin kampus.")
     token = new_id() + new_id()
     await db.sessions.insert_one({"token": token, "user_id": user["id"], "created_at": now_iso()})
     await db.users.update_one({"id": user["id"]}, {"$set": {"last_login_at": now_iso()}})
@@ -2157,7 +3287,12 @@ async def forgot_password(payload: ForgotPasswordInput, background_tasks: Backgr
     identifier = payload.identifier.strip().lower()
     user = await db.users.find_one(identity_query(identifier), {"_id": 0})
     if not user:
-        raise HTTPException(status_code=404, detail="Email tidak terdaftar")
+        return {
+            "ok": True,
+            "message": "Jika akun ditemukan, permintaan reset password akan diproses.",
+            "otp_delivery": {"status": "not_found", "message_id": ""},
+            "email_delivery": {"status": "not_found", "error": ""},
+        }
     response: Dict[str, Any] = {
         "ok": True,
         "message": "Jika akun ditemukan, permintaan reset password akan diproses.",
@@ -2361,16 +3496,28 @@ async def update_profile(payload: ProfileInput, user: Dict[str, Any] = Depends(g
             }
         },
     )
+    if user.get("role") in {"admin", "lecturer"} and name != user.get("name"):
+        await db.classes.update_many({"lecturer_id": user["id"]}, {"$set": {"lecturer_name": name}})
+        for collection in [db.materials, db.assignments, db.submissions, db.enrollment_requests, db.reminder_logs]:
+            await collection.update_many({"lecturer_id": user["id"]}, {"$set": {"lecturer_name": name}})
     updated = await db.users.find_one({"id": user["id"]}, {"_id": 0})
     return public_doc(updated)
 
 
 @api_router.post("/auth/logout")
 async def logout(authorization: Optional[str] = Header(None)):
+    logout_url = ""
     if authorization and authorization.startswith("Bearer "):
         token = authorization.replace("Bearer ", "", 1).strip()
-        await db.sessions.delete_one({"token": token})
-    return {"ok": True}
+        session = await db.sessions.find_one_and_delete({"token": token}, {"_id": 0})
+        if session and session.get("auth_source") == "sso" and oidc_settings()["enabled"]:
+            try:
+                settings = oidc_require_settings()
+                metadata = await oidc_discovery()
+                logout_url = f"{metadata['end_session_endpoint']}?{urlencode({'client_id': settings['client_id'], 'post_logout_redirect_uri': settings['frontend_url']})}"
+            except HTTPException:
+                logout_url = ""
+    return {"ok": True, "logout_url": logout_url}
 
 
 @api_router.get("/password-reset-requests")
@@ -2378,13 +3525,151 @@ async def list_password_reset_requests(_: Dict[str, Any] = Depends(require_admin
     return await db.password_reset_requests.find({}, {"_id": 0}).sort("requested_at", -1).to_list(1000)
 
 
+@api_router.get("/lecturers")
+async def list_lecturers(_: Dict[str, Any] = Depends(require_campus_admin)):
+    lecturers = await db.users.find(
+        {"role": "lecturer", "status": {"$ne": "deleted"}}, {"_id": 0, "password_hash": 0}
+    ).sort("name", 1).to_list(2000)
+    counts = await db.classes.aggregate(
+        [
+            {"$match": {"status": {"$ne": "deleted"}, "lecturer_id": {"$ne": ""}}},
+            {"$group": {"_id": "$lecturer_id", "total": {"$sum": 1}}},
+        ]
+    ).to_list(2000)
+    class_counts = {item["_id"]: item["total"] for item in counts}
+    storage_counts = await db.stored_files.aggregate(
+        [
+            {"$match": {"lecturer_id": {"$nin": ["", None]}}},
+            {
+                "$group": {
+                    "_id": "$lecturer_id",
+                    "file_count": {"$sum": 1},
+                    "storage_bytes": {"$sum": {"$ifNull": ["$size", 0]}},
+                    "drive_synced_count": {
+                        "$sum": {"$cond": [{"$eq": ["$drive_sync_status", "synced"]}, 1, 0]}
+                    },
+                    "drive_failed_count": {
+                        "$sum": {"$cond": [{"$eq": ["$drive_sync_status", "failed"]}, 1, 0]}
+                    },
+                }
+            },
+        ]
+    ).to_list(2000)
+    lecturer_storage = {item["_id"]: item for item in storage_counts}
+    for lecturer in lecturers:
+        lecturer["class_count"] = class_counts.get(lecturer["id"], 0)
+        storage = lecturer_storage.get(lecturer["id"], {})
+        lecturer["storage_file_count"] = storage.get("file_count", 0)
+        lecturer["storage_bytes"] = storage.get("storage_bytes", 0)
+        lecturer["drive_synced_count"] = storage.get("drive_synced_count", 0)
+        lecturer["drive_failed_count"] = storage.get("drive_failed_count", 0)
+    return lecturers
+
+
+@api_router.post("/lecturers")
+async def create_lecturer(
+    payload: LecturerInput,
+    background_tasks: BackgroundTasks,
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
+    if payload.status not in {"active", "inactive"}:
+        raise HTTPException(status_code=400, detail="Status dosen harus active atau inactive")
+    username = payload.username.strip().lower()
+    email = payload.email.lower()
+    duplicate = await db.users.find_one({"$or": [{"username": username}, {"email": email}]}, {"_id": 0, "id": 1})
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Username atau email dosen sudah digunakan")
+    doc = {
+        "id": new_id(),
+        "role": "lecturer",
+        "employee_id": payload.employee_id.strip(),
+        "username": username,
+        "name": payload.name.strip(),
+        "email": email,
+        "whatsapp": payload.whatsapp.strip(),
+        "password_hash": hash_password(payload.password),
+        "status": payload.status,
+        "created_at": now_iso(),
+        "last_login_at": "",
+    }
+    await db.users.insert_one(doc)
+    background_tasks.add_task(reconcile_lecturer_drive_access, doc["id"])
+    return public_doc(doc)
+
+
+@api_router.put("/lecturers/{lecturer_id}")
+async def update_lecturer(
+    lecturer_id: str,
+    payload: LecturerUpdateInput,
+    background_tasks: BackgroundTasks,
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
+    existing = await db.users.find_one({"id": lecturer_id, "role": "lecturer", "status": {"$ne": "deleted"}}, {"_id": 0})
+    if not existing:
+        raise HTTPException(status_code=404, detail="Dosen tidak ditemukan")
+    if payload.status not in {"active", "inactive"}:
+        raise HTTPException(status_code=400, detail="Status dosen harus active atau inactive")
+    username = payload.username.strip().lower()
+    email = payload.email.lower()
+    duplicate = await db.users.find_one(
+        {"id": {"$ne": lecturer_id}, "$or": [{"username": username}, {"email": email}]}, {"_id": 0, "id": 1}
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Username atau email dosen sudah digunakan")
+    update = payload.model_dump()
+    update.update({"username": username, "email": email, "updated_at": now_iso()})
+    await db.users.update_one({"id": lecturer_id}, {"$set": update})
+    if payload.name != existing.get("name"):
+        await db.classes.update_many({"lecturer_id": lecturer_id}, {"$set": {"lecturer_name": payload.name}})
+        for collection in [db.materials, db.assignments, db.submissions, db.enrollment_requests, db.reminder_logs]:
+            await collection.update_many({"lecturer_id": lecturer_id}, {"$set": {"lecturer_name": payload.name}})
+    background_tasks.add_task(reconcile_lecturer_drive_access, lecturer_id)
+    return public_doc(await db.users.find_one({"id": lecturer_id}, {"_id": 0}))
+
+
+@api_router.post("/lecturers/{lecturer_id}/reset-password")
+async def reset_lecturer_password(
+    lecturer_id: str, payload: ResetPasswordInput, _: Dict[str, Any] = Depends(require_campus_admin)
+):
+    lecturer = await db.users.find_one({"id": lecturer_id, "role": "lecturer", "status": {"$ne": "deleted"}}, {"_id": 0})
+    if not lecturer:
+        raise HTTPException(status_code=404, detail="Dosen tidak ditemukan")
+    password = payload.password.strip() or "Dosen123!"
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password dosen minimal 6 karakter")
+    await db.users.update_one(
+        {"id": lecturer_id}, {"$set": {"password_hash": hash_password(password), "password_reset_at": now_iso()}}
+    )
+    await db.sessions.delete_many({"user_id": lecturer_id})
+    return {"ok": True, "temporary_password": password}
+
+
+@api_router.delete("/lecturers/{lecturer_id}")
+async def delete_lecturer(
+    lecturer_id: str,
+    background_tasks: BackgroundTasks,
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
+    active_classes = await db.classes.count_documents({"lecturer_id": lecturer_id, "status": "active"})
+    if active_classes:
+        raise HTTPException(status_code=400, detail="Dosen masih memiliki kelas aktif. Arsipkan atau pindahkan kelas terlebih dahulu.")
+    result = await db.users.update_one(
+        {"id": lecturer_id, "role": "lecturer"}, {"$set": {"status": "deleted", "deleted_at": now_iso()}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Dosen tidak ditemukan")
+    await db.sessions.delete_many({"user_id": lecturer_id})
+    background_tasks.add_task(reconcile_lecturer_drive_access, lecturer_id)
+    return {"ok": True}
+
+
 @api_router.get("/whatsapp/settings")
-async def whatsapp_settings(_: Dict[str, Any] = Depends(require_admin)):
+async def whatsapp_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
     return await get_whatsapp_settings(mask=True)
 
 
 @api_router.put("/whatsapp/settings")
-async def update_whatsapp_settings(payload: WhatsAppSettingsInput, user: Dict[str, Any] = Depends(require_admin)):
+async def update_whatsapp_settings(payload: WhatsAppSettingsInput, user: Dict[str, Any] = Depends(require_campus_admin)):
     existing = await get_whatsapp_settings(mask=False)
     doc = payload.model_dump()
     if not doc.get("fonnte_token") and existing.get("fonnte_token"):
@@ -2398,12 +3683,12 @@ async def update_whatsapp_settings(payload: WhatsAppSettingsInput, user: Dict[st
 
 
 @api_router.get("/whatsapp/messages")
-async def whatsapp_messages(_: Dict[str, Any] = Depends(require_admin)):
+async def whatsapp_messages(_: Dict[str, Any] = Depends(require_campus_admin)):
     return await db.whatsapp_messages.find({}, {"_id": 0}).sort("created_at", -1).to_list(1000)
 
 
 @api_router.get("/whatsapp/waha/status")
-async def waha_connection_status(_: Dict[str, Any] = Depends(require_admin)):
+async def waha_connection_status(_: Dict[str, Any] = Depends(require_campus_admin)):
     settings = await get_whatsapp_settings(mask=False)
     base_url = normalize_http_base_url(settings.get("waha_base_url", ""))
     session = (settings.get("waha_session") or "default").strip() or "default"
@@ -2431,7 +3716,7 @@ async def waha_connection_status(_: Dict[str, Any] = Depends(require_admin)):
 
 
 @api_router.post("/whatsapp/messages/{message_id}/retry")
-async def retry_whatsapp_message(message_id: str, background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_admin)):
+async def retry_whatsapp_message(message_id: str, background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_campus_admin)):
     msg = await db.whatsapp_messages.find_one({"id": message_id}, {"_id": 0})
     if not msg:
         raise HTTPException(status_code=404, detail="Pesan tidak ditemukan")
@@ -2441,12 +3726,12 @@ async def retry_whatsapp_message(message_id: str, background_tasks: BackgroundTa
 
 
 @api_router.get("/email/settings")
-async def email_settings(_: Dict[str, Any] = Depends(require_admin)):
+async def email_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
     return await get_email_settings(mask=True)
 
 
 @api_router.put("/email/settings")
-async def update_email_settings(payload: EmailSettingsInput, user: Dict[str, Any] = Depends(require_admin)):
+async def update_email_settings(payload: EmailSettingsInput, user: Dict[str, Any] = Depends(require_campus_admin)):
     existing = await get_email_settings(mask=False)
     doc = payload.model_dump()
     if not doc.get("smtp_password") and existing.get("smtp_password"):
@@ -2458,7 +3743,7 @@ async def update_email_settings(payload: EmailSettingsInput, user: Dict[str, Any
 
 
 @api_router.post("/email/settings/test")
-async def test_email_settings(_: Dict[str, Any] = Depends(require_admin)):
+async def test_email_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
     settings = await get_email_settings(mask=False)
     if not settings.get("enabled"):
         raise HTTPException(status_code=400, detail="Email belum diaktifkan")
@@ -2473,6 +3758,59 @@ async def test_email_settings(_: Dict[str, Any] = Depends(require_admin)):
     if not result["ok"]:
         raise HTTPException(status_code=400, detail=result.get("error", "Gagal mengirim email tes"))
     return {"ok": True, "message": f"Email tes berhasil dikirim ke {test_email}"}
+
+
+@api_router.get("/sso/settings")
+async def get_oidc_admin_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
+    doc = await db.oidc_settings.find_one({"id": "main"}, {"_id": 0}) or {}
+    return oidc_admin_view(oidc_settings(), "admin_ui" if doc else "environment", doc)
+
+
+@api_router.put("/sso/settings")
+async def update_oidc_admin_settings(payload: OidcSettingsInput, user: Dict[str, Any] = Depends(require_campus_admin)):
+    discovery_url = validate_oidc_url(payload.discovery_url, "Discovery URL", required=payload.enabled)
+    issuer = validate_oidc_url(payload.issuer, "Issuer", required=False)
+    redirect_uri = validate_oidc_url(payload.redirect_uri, "Redirect URI", required=payload.enabled)
+    frontend_url = validate_oidc_url(payload.frontend_url, "Frontend URL", required=payload.enabled)
+    client_id = payload.client_id.strip()
+    scopes = " ".join(payload.scopes.split())
+    if payload.enabled and not client_id:
+        raise HTTPException(status_code=400, detail="Client ID wajib diisi saat SSO aktif")
+    if payload.enabled and "openid" not in scopes.split():
+        raise HTTPException(status_code=400, detail="Scope openid wajib disertakan")
+
+    existing_secret = oidc_settings().get("client_secret", "")
+    client_secret = "" if payload.clear_client_secret else (payload.client_secret.strip() or existing_secret)
+    doc = {
+        "id": "main",
+        "enabled": bool(payload.enabled),
+        "discovery_url": discovery_url,
+        "issuer": issuer,
+        "client_id": client_id,
+        "client_secret_encrypted": encrypt_secret(client_secret) if client_secret else "",
+        "redirect_uri": redirect_uri,
+        "frontend_url": frontend_url,
+        "scopes": scopes or "openid profile email roles",
+        "local_login_enabled": bool(payload.local_login_enabled),
+        "updated_at": now_iso(),
+        "updated_by": user["id"],
+    }
+    await db.oidc_settings.update_one({"id": "main"}, {"$set": doc}, upsert=True)
+    return await load_oidc_runtime_settings()
+
+
+@api_router.post("/sso/settings/test")
+async def test_oidc_admin_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
+    metadata = await oidc_discovery(force=True)
+    settings = oidc_require_settings()
+    return {
+        "ok": True,
+        "message": "Koneksi SCI-ID berhasil",
+        "issuer": metadata.get("issuer", ""),
+        "authorization_endpoint": metadata.get("authorization_endpoint", ""),
+        "client_id": settings.get("client_id", ""),
+        "client_secret_configured": bool(settings.get("client_secret")),
+    }
 
 
 @api_router.post("/classes/join-request")
@@ -2507,6 +3845,8 @@ async def request_join_class(payload: JoinRequestInput, user: Dict[str, Any] = D
         "class_id": class_doc["id"],
         "class_name": class_doc["name"],
         "class_code": class_doc.get("class_code", ""),
+        "lecturer_id": class_doc.get("lecturer_id", ""),
+        "lecturer_name": class_doc.get("lecturer_name", ""),
         "student_id": user["id"],
         "student_name": user["name"],
         "student_nim": user.get("nim", ""),
@@ -2522,6 +3862,10 @@ async def request_join_class(payload: JoinRequestInput, user: Dict[str, Any] = D
 async def list_enrollment_requests(user: Dict[str, Any] = Depends(get_current_user)):
     if user.get("role") == "admin":
         return await db.enrollment_requests.find({}, {"_id": 0}).sort("requested_at", -1).to_list(1000)
+    if user.get("role") == "lecturer":
+        return await db.enrollment_requests.find(
+            {"class_id": {"$in": await lecturer_class_ids(user)}}, {"_id": 0}
+        ).sort("requested_at", -1).to_list(1000)
     return await db.enrollment_requests.find({"student_id": user["id"]}, {"_id": 0}).sort("requested_at", -1).to_list(1000)
 
 
@@ -2530,6 +3874,7 @@ async def approve_enrollment_request(request_id: str, user: Dict[str, Any] = Dep
     request_doc = await db.enrollment_requests.find_one({"id": request_id}, {"_id": 0})
     if not request_doc:
         raise HTTPException(status_code=404, detail="Request tidak ditemukan")
+    await require_class_access(request_doc.get("class_id", ""), user)
     await db.users.update_one({"id": request_doc["student_id"]}, {"$addToSet": {"class_ids": request_doc["class_id"]}})
     await db.classes.update_one({"id": request_doc["class_id"]}, {"$addToSet": {"student_ids": request_doc["student_id"]}})
     await db.enrollment_requests.update_one(
@@ -2542,6 +3887,10 @@ async def approve_enrollment_request(request_id: str, user: Dict[str, Any] = Dep
 
 @api_router.post("/enrollment-requests/{request_id}/reject")
 async def reject_enrollment_request(request_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    request_doc = await db.enrollment_requests.find_one({"id": request_id}, {"_id": 0})
+    if not request_doc:
+        raise HTTPException(status_code=404, detail="Request tidak ditemukan")
+    await require_class_access(request_doc.get("class_id", ""), user)
     await db.enrollment_requests.update_one(
         {"id": request_id},
         {"$set": {"status": "rejected", "rejected_at": now_iso(), "rejected_by": user["id"]}},
@@ -2553,13 +3902,18 @@ async def reject_enrollment_request(request_id: str, user: Dict[str, Any] = Depe
 
 
 @api_router.get("/dashboard")
-async def dashboard(_: Dict[str, Any] = Depends(require_admin)):
-    active_courses_count = await db.courses.count_documents({"status": "active"})
-    active_classes_count = await db.classes.count_documents({"status": "active"})
-    assignments = await db.assignments.find({"is_active": True}, {"_id": 0}).to_list(500)
-    submissions = await db.submissions.find({}, {"_id": 0}).to_list(2000)
-    comments = await db.comments.find({}, {"_id": 0}).sort("created_at", -1).to_list(5)
-    students = await db.users.find({"role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
+async def dashboard(user: Dict[str, Any] = Depends(require_admin)):
+    class_ids = await lecturer_class_ids(user)
+    class_query = {"id": {"$in": class_ids}}
+    active_classes = await db.classes.find({**class_query, "status": "active"}, {"_id": 0}).to_list(500)
+    active_courses_count = len({item.get("course_id") for item in active_classes if item.get("course_id")})
+    active_classes_count = len(active_classes)
+    assignments = await db.assignments.find({"class_id": {"$in": class_ids}, "is_active": True}, {"_id": 0}).to_list(500)
+    submissions = await db.submissions.find({"class_id": {"$in": class_ids}}, {"_id": 0}).to_list(2000)
+    material_ids = [item["id"] for item in await db.materials.find({"class_id": {"$in": class_ids}}, {"_id": 0, "id": 1}).to_list(5000)]
+    comments = await db.comments.find({"material_id": {"$in": material_ids}}, {"_id": 0}).sort("created_at", -1).to_list(5)
+    student_ids = list({student_id for item in active_classes for student_id in item.get("student_ids", [])})
+    students = await db.users.find({"id": {"$in": student_ids}, "role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
     now = datetime.now(timezone.utc)
     soon = now + timedelta(days=3)
     published_assignments = [assignment for assignment in assignments if assignment_is_published(assignment, now)]
@@ -2573,7 +3927,7 @@ async def dashboard(_: Dict[str, Any] = Depends(require_admin)):
             continue
     submitted_pairs = {(s.get("assignment_id"), s.get("student_id")) for s in submissions}
     missing = 0
-    classes_for_missing = await db.classes.find({"status": "active"}, {"_id": 0, "id": 1, "student_ids": 1}).to_list(500)
+    classes_for_missing = active_classes
     for assignment in published_assignments:
         class_doc = next((c for c in classes_for_missing if c["id"] == assignment.get("class_id")), None)
         if class_doc:
@@ -2583,7 +3937,7 @@ async def dashboard(_: Dict[str, Any] = Depends(require_admin)):
     ungraded = len([s for s in submissions if s.get("status") in ["Sudah Submit", "Terlambat", "Direvisi"]])
     avg_grade_values = [s.get("grade", 0) for s in submissions if isinstance(s.get("grade"), (int, float))]
     avg_grade = round(sum(avg_grade_values) / len(avg_grade_values), 1) if avg_grade_values else 0
-    progress_map = await calculate_student_progress_many([s["id"] for s in students])
+    progress_map = await calculate_student_progress_many([s["id"] for s in students], class_ids)
     risk_high = sum(1 for p in progress_map.values() if p.get("risk_label") == "Risiko Tinggi")
     return {
         "summary": {
@@ -2791,7 +4145,7 @@ async def execute_clean_data_module(module: str) -> Dict[str, Any]:
 
 
 @api_router.get("/clean-data/summary")
-async def clean_data_summary(_: Dict[str, Any] = Depends(require_admin)):
+async def clean_data_summary(_: Dict[str, Any] = Depends(require_campus_admin)):
     counts = await clean_data_module_counts()
     return [
         {"key": key, **meta, "count": counts.get(key, sum(counts.values()) if key == "all" else 0)}
@@ -2800,7 +4154,7 @@ async def clean_data_summary(_: Dict[str, Any] = Depends(require_admin)):
 
 
 @api_router.post("/clean-data/{module}")
-async def clean_data(module: str, payload: CleanDataInput, _: Dict[str, Any] = Depends(require_admin)):
+async def clean_data(module: str, payload: CleanDataInput, _: Dict[str, Any] = Depends(require_campus_admin)):
     if payload.confirmation != "HAPUS":
         raise HTTPException(status_code=400, detail="Konfirmasi clean data tidak valid")
     result = await execute_clean_data_module(module)
@@ -2809,7 +4163,7 @@ async def clean_data(module: str, payload: CleanDataInput, _: Dict[str, Any] = D
 
 
 @api_router.get("/storage/status")
-async def storage_status(_: Dict[str, Any] = Depends(require_admin)):
+async def storage_status(_: Dict[str, Any] = Depends(require_campus_admin)):
     return {
         **await storage_status_summary(),
         "files": {
@@ -2867,18 +4221,82 @@ async def drive_sync_overview(limit: int = 50) -> Dict[str, Any]:
     return {"summary": summary, "items": items}
 
 
+@api_router.get("/database-backups")
+async def list_database_backups(_: Dict[str, Any] = Depends(require_campus_admin)):
+    settings = await get_database_backup_settings()
+    backups = await db.database_backups.find({}, {"_id": 0, "local_path": 0}).sort("created_at", -1).to_list(100)
+    drive_settings = await get_google_drive_settings(mask=True)
+    return {
+        "settings": settings,
+        "backups": backups,
+        "drive_ready": google_drive_upload_enabled(drive_settings),
+        "drive_account": drive_settings.get("service_account_email", ""),
+        "drive_folder": f"{drive_settings.get('root_folder_name', 'E-Learning Dosen')} / Database Backups",
+    }
+
+
+@api_router.put("/database-backups/settings")
+async def update_database_backup_settings(
+    payload: DatabaseBackupSettingsInput,
+    user: Dict[str, Any] = Depends(require_campus_admin),
+):
+    if payload.frequency not in {"daily", "weekly"}:
+        raise HTTPException(status_code=400, detail="Frekuensi backup harus harian atau mingguan")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", payload.run_time):
+        raise HTTPException(status_code=400, detail="Waktu backup harus memakai format HH:MM")
+    if payload.enabled and payload.upload_to_drive:
+        drive_settings = await get_google_drive_settings(mask=True)
+        if not google_drive_upload_enabled(drive_settings):
+            raise HTTPException(
+                status_code=400,
+                detail="Aktifkan dan simpan konfigurasi Google Drive sebelum menjadwalkan backup ke Drive",
+            )
+    doc = {
+        "id": "main",
+        **payload.model_dump(),
+        "timezone": str(BACKUP_TIMEZONE),
+        "next_run_at": next_database_backup_at(payload.model_dump()) if payload.enabled else "",
+        "updated_at": now_iso(),
+        "updated_by": user["id"],
+        "running": False,
+    }
+    await db.database_backup_settings.update_one({"id": "main"}, {"$set": doc}, upsert=True)
+    return await get_database_backup_settings()
+
+
+@api_router.post("/database-backups/run")
+async def run_database_backup(user: Dict[str, Any] = Depends(require_campus_admin)):
+    running = await db.database_backups.find_one({"status": "running"}, {"_id": 0, "id": 1})
+    if running:
+        raise HTTPException(status_code=409, detail="Proses backup lain masih berjalan")
+    return await create_database_backup("manual", user["id"])
+
+
+@api_router.get("/database-backups/{backup_id}/download")
+async def download_database_backup(
+    backup_id: str, _: Dict[str, Any] = Depends(require_campus_admin)
+):
+    backup = await db.database_backups.find_one({"id": backup_id}, {"_id": 0})
+    if not backup or not backup.get("local_available") or not backup.get("local_path"):
+        raise HTTPException(status_code=404, detail="File backup lokal tidak tersedia")
+    path = Path(backup["local_path"]).resolve()
+    if BACKUP_ROOT.resolve() not in path.parents or not path.exists():
+        raise HTTPException(status_code=404, detail="File backup lokal tidak ditemukan")
+    return FileResponse(path, filename=backup.get("file_name", path.name), media_type="application/gzip")
+
+
 @api_router.get("/drive/settings")
-async def get_drive_settings(_: Dict[str, Any] = Depends(require_admin)):
+async def get_drive_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
     return {**await get_google_drive_settings(mask=True), **await storage_status_summary(), **await drive_sync_overview()}
 
 
 @api_router.get("/drive/sync-status")
-async def get_drive_sync_status(_: Dict[str, Any] = Depends(require_admin)):
+async def get_drive_sync_status(_: Dict[str, Any] = Depends(require_campus_admin)):
     return await drive_sync_overview()
 
 
 @api_router.post("/drive/sync/{file_id}/retry")
-async def retry_drive_sync_file(file_id: str, background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_admin)):
+async def retry_drive_sync_file(file_id: str, background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_campus_admin)):
     file_doc = await db.stored_files.find_one({"id": file_id}, {"_id": 0})
     if not file_doc:
         raise HTTPException(status_code=404, detail="File tidak ditemukan")
@@ -2892,7 +4310,7 @@ async def retry_drive_sync_file(file_id: str, background_tasks: BackgroundTasks,
 
 
 @api_router.post("/drive/sync/retry-failed")
-async def retry_failed_drive_sync(background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_admin)):
+async def retry_failed_drive_sync(background_tasks: BackgroundTasks, _: Dict[str, Any] = Depends(require_campus_admin)):
     failed = await db.stored_files.find({"drive_sync_status": "failed"}, {"_id": 0, "id": 1}).to_list(100)
     for item in failed:
         file_id = item["id"]
@@ -2906,7 +4324,16 @@ async def retry_failed_drive_sync(background_tasks: BackgroundTasks, _: Dict[str
 
 
 @api_router.put("/drive/settings")
-async def update_drive_settings(payload: GoogleDriveSettingsInput, user: Dict[str, Any] = Depends(require_admin)):
+async def update_drive_settings(
+    payload: GoogleDriveSettingsInput,
+    background_tasks: BackgroundTasks,
+    user: Dict[str, Any] = Depends(require_campus_admin),
+):
+    if payload.lecturer_folder_role not in {"reader", "writer"}:
+        raise HTTPException(status_code=400, detail="Akses folder dosen harus reader atau writer")
+    delegated_user = payload.google_workspace_delegated_user.strip().lower()
+    if delegated_user and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", delegated_user):
+        raise HTTPException(status_code=400, detail="Email Google Workspace untuk Meet tidak valid")
     existing = await db.google_drive_settings.find_one({"id": "main"}, {"_id": 0}) or {}
     service_account_json_encrypted = existing.get("service_account_json_encrypted", "")
     service_account_email = existing.get("service_account_email", "")
@@ -2927,6 +4354,10 @@ async def update_drive_settings(payload: GoogleDriveSettingsInput, user: Dict[st
         "root_folder_id": payload.root_folder_id.strip(),
         "root_folder_name": safe_path_segment(payload.root_folder_name or "E-Learning Dosen"),
         "require_upload": payload.require_upload,
+        "lecturer_folder_sharing_enabled": payload.lecturer_folder_sharing_enabled,
+        "lecturer_folder_role": payload.lecturer_folder_role,
+        "google_meet_enabled": payload.google_meet_enabled,
+        "google_workspace_delegated_user": delegated_user,
         "service_account_json_encrypted": service_account_json_encrypted,
         "service_account_email": service_account_email,
         "updated_at": now_iso(),
@@ -2934,6 +4365,7 @@ async def update_drive_settings(payload: GoogleDriveSettingsInput, user: Dict[st
     }
     await db.google_drive_settings.update_one({"id": "main"}, {"$set": doc}, upsert=True)
     _invalidate_settings_cache("google_drive_settings")
+    background_tasks.add_task(reconcile_all_lecturer_drive_access)
     return {**await get_google_drive_settings(mask=True), **await storage_status_summary(), **await drive_sync_overview()}
 
 
@@ -2972,7 +4404,7 @@ def test_drive_connection_sync(settings: Dict[str, Any]) -> Dict[str, Any]:
 
 
 @api_router.post("/drive/settings/test")
-async def test_drive_settings(_: Dict[str, Any] = Depends(require_admin)):
+async def test_drive_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
     settings = await get_google_drive_settings(mask=False)
     if not google_drive_upload_enabled(settings):
         raise HTTPException(status_code=400, detail="Google Drive belum aktif atau credential belum tersimpan")
@@ -2981,6 +4413,29 @@ async def test_drive_settings(_: Dict[str, Any] = Depends(require_admin)):
     except Exception as exc:
         logger.exception("Tes koneksi Google Drive gagal: %s", exc)
         raise HTTPException(status_code=400, detail=google_drive_error_message(exc))
+
+
+@api_router.post("/drive/settings/test-meet")
+async def test_google_meet_settings(_: Dict[str, Any] = Depends(require_campus_admin)):
+    settings = await get_google_drive_settings(mask=False)
+    if not settings.get("google_meet_enabled"):
+        raise HTTPException(status_code=400, detail="Google Meet REST API belum diaktifkan pada konfigurasi admin")
+    if not settings.get("service_account_configured"):
+        raise HTTPException(status_code=400, detail="Service Account JSON belum tersimpan")
+    delegated_user = settings.get("google_workspace_delegated_user", "")
+    if not delegated_user:
+        raise HTTPException(status_code=400, detail="Email akun Google Workspace untuk pengujian belum diisi")
+    try:
+        meet = await asyncio.to_thread(create_google_meet_space_sync, settings, delegated_user)
+    except Exception as exc:
+        logger.warning("Tes koneksi Google Meet gagal: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
+    return {
+        "ok": True,
+        "message": "Koneksi Google Meet berhasil dan ruang uji telah dibuat",
+        "delegated_user": delegated_user,
+        **meet,
+    }
 
 
 @api_router.get("/programs")
@@ -3029,10 +4484,12 @@ async def list_courses(_: Dict[str, Any] = Depends(get_current_user)):
 
 @api_router.post("/courses")
 async def create_course(payload: CourseInput, _: Dict[str, Any] = Depends(require_admin)):
-    program = await db.programs.find_one({"id": payload.program_id, "status": {"$ne": "deleted"}}, {"_id": 0})
+    program_query = {"id": payload.program_id, "status": {"$ne": "deleted"}} if payload.program_id else {"status": {"$ne": "deleted"}}
+    program = await db.programs.find_one(program_query, {"_id": 0})
     if not program:
         raise HTTPException(status_code=404, detail="Prodi tidak ditemukan")
     doc = payload.model_dump()
+    doc["program_id"] = program["id"]
     doc.update({"id": new_id(), "program_name": program["name"], "status": "active", "created_at": now_iso()})
     await db.courses.insert_one(doc)
     return public_doc(doc)
@@ -3043,10 +4500,12 @@ async def update_course(course_id: str, payload: CourseInput, _: Dict[str, Any] 
     existing = await db.courses.find_one({"id": course_id, "status": {"$ne": "deleted"}}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Mata kuliah tidak ditemukan")
-    program = await db.programs.find_one({"id": payload.program_id, "status": {"$ne": "deleted"}}, {"_id": 0})
+    selected_program_id = payload.program_id or existing.get("program_id", "")
+    program = await db.programs.find_one({"id": selected_program_id, "status": {"$ne": "deleted"}}, {"_id": 0})
     if not program:
         raise HTTPException(status_code=404, detail="Prodi tidak ditemukan")
     update = payload.model_dump()
+    update["program_id"] = program["id"]
     update.update({"program_name": program["name"], "updated_at": now_iso()})
     await db.courses.update_one({"id": course_id}, {"$set": update})
     await db.classes.update_many(
@@ -3073,12 +4532,14 @@ async def list_classes(user: Dict[str, Any] = Depends(get_current_user)):
     query: Dict[str, Any] = {"status": {"$ne": "deleted"}}
     if user["role"] == "student":
         query = {"id": {"$in": user.get("class_ids", [])}, "status": {"$ne": "deleted"}}
+    elif user["role"] == "lecturer":
+        query["lecturer_id"] = user["id"]
     classes = await db.classes.find(query, {"_id": 0}).sort("created_at", -1).to_list(500)
     return [await enrich_class_payload(item) for item in classes]
 
 
 @api_router.post("/classes")
-async def create_class(payload: ClassInput, _: Dict[str, Any] = Depends(require_admin)):
+async def create_class(payload: ClassInput, user: Dict[str, Any] = Depends(require_admin)):
     course = await db.courses.find_one({"id": payload.course_id, "status": {"$ne": "deleted"}}, {"_id": 0})
     if not course:
         raise HTTPException(status_code=404, detail="Mata kuliah tidak ditemukan")
@@ -3091,6 +4552,8 @@ async def create_class(payload: ClassInput, _: Dict[str, Any] = Depends(require_
             "program_id": course.get("program_id", ""),
             "program_name": course.get("program_name", ""),
             "class_code": clean_code(code_seed),
+            "lecturer_id": user["id"],
+            "lecturer_name": user.get("name", "Dosen"),
             "status": "active",
             "student_ids": [],
             "created_at": now_iso(),
@@ -3101,10 +4564,8 @@ async def create_class(payload: ClassInput, _: Dict[str, Any] = Depends(require_
 
 
 @api_router.put("/classes/{class_id}")
-async def update_class(class_id: str, payload: ClassInput, _: Dict[str, Any] = Depends(require_admin)):
-    existing = await db.classes.find_one({"id": class_id, "status": {"$ne": "deleted"}}, {"_id": 0})
-    if not existing:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+async def update_class(class_id: str, payload: ClassInput, user: Dict[str, Any] = Depends(require_admin)):
+    existing = await require_class_access(class_id, user)
     course = await db.courses.find_one({"id": payload.course_id, "status": {"$ne": "deleted"}}, {"_id": 0})
     if not course:
         raise HTTPException(status_code=404, detail="Mata kuliah tidak ditemukan")
@@ -3123,7 +4584,8 @@ async def update_class(class_id: str, payload: ClassInput, _: Dict[str, Any] = D
 
 
 @api_router.delete("/classes/{class_id}")
-async def delete_class(class_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def delete_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    await require_class_access(class_id, user)
     result = await db.classes.update_one({"id": class_id}, {"$set": {"status": "deleted", "deleted_at": now_iso()}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
@@ -3132,33 +4594,34 @@ async def delete_class(class_id: str, _: Dict[str, Any] = Depends(require_admin)
 
 
 @api_router.post("/classes/{class_id}/archive")
-async def archive_class(class_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def archive_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    await require_class_access(class_id, user)
     await db.classes.update_one({"id": class_id}, {"$set": {"status": "archived", "archived_at": now_iso()}})
     return {"ok": True}
 
 
 @api_router.post("/classes/{class_id}/end")
-async def end_class(class_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def end_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    await require_class_access(class_id, user)
     await db.classes.update_one({"id": class_id}, {"$set": {"status": "ended", "ended_at": now_iso()}})
     return {"ok": True}
 
 
 @api_router.get("/classes/{class_id}/students")
-async def class_students(class_id: str, _: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await db.classes.find_one({"id": class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+async def class_students(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    class_doc = await require_class_access(class_id, user)
     students = await db.users.find(
         {"role": "student", "class_ids": class_id}, {"_id": 0, "password_hash": 0}
     ).sort("name", 1).to_list(1000)
-    progress_map = await calculate_student_progress_many([s["id"] for s in students])
+    progress_map = await calculate_student_progress_many([s["id"] for s in students], [class_id])
     for student in students:
         student["progress"] = progress_map.get(student["id"], {})
     return {"class": await enrich_class_payload(class_doc), "students": students}
 
 
 @api_router.post("/classes/{class_id}/students/{student_id}/remove")
-async def remove_student_from_class(class_id: str, student_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def remove_student_from_class(class_id: str, student_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    await require_class_access(class_id, user)
     await db.classes.update_one({"id": class_id}, {"$pull": {"student_ids": student_id}})
     await db.users.update_one({"id": student_id}, {"$pull": {"class_ids": class_id}})
     return {"ok": True}
@@ -3166,7 +4629,7 @@ async def remove_student_from_class(class_id: str, student_id: str, _: Dict[str,
 
 @api_router.post("/classes/{class_id}/students/{student_id}/add")
 async def add_existing_student_to_class(class_id: str, student_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await get_manageable_class(class_id)
+    class_doc = await get_manageable_class(class_id, user=user)
     student = await get_active_student(student_id)
     result = await add_student_to_class_record(class_doc, student, user["id"])
     return {"ok": True, **result}
@@ -3177,7 +4640,7 @@ async def bulk_add_existing_students_to_class(class_id: str, payload: StudentIds
     student_ids = unique_ids(payload.student_ids)
     if not student_ids:
         raise HTTPException(status_code=400, detail="Pilih minimal satu mahasiswa")
-    class_doc = await get_manageable_class(class_id)
+    class_doc = await get_manageable_class(class_id, user=user)
     results = []
     for student_id in student_ids:
         try:
@@ -3198,7 +4661,7 @@ async def invite_student_to_class(
     background_tasks: BackgroundTasks,
     user: Dict[str, Any] = Depends(require_admin),
 ):
-    class_doc = await get_manageable_class(class_id, active_only=True)
+    class_doc = await get_manageable_class(class_id, active_only=True, user=user)
     student = await get_active_student(student_id)
     result = await invite_student_to_class_record(class_doc, student, background_tasks, user["id"])
     return {"ok": True, **result}
@@ -3214,7 +4677,7 @@ async def bulk_invite_students_to_class(
     student_ids = unique_ids(payload.student_ids)
     if not student_ids:
         raise HTTPException(status_code=400, detail="Pilih minimal satu mahasiswa")
-    class_doc = await get_manageable_class(class_id, active_only=True)
+    class_doc = await get_manageable_class(class_id, active_only=True, user=user)
     results = []
     for student_id in student_ids:
         try:
@@ -3241,7 +4704,11 @@ async def bulk_invite_students_to_class(
 
 
 @api_router.post("/students/{student_id}/status")
-async def update_student_status(student_id: str, payload: Dict[str, str], _: Dict[str, Any] = Depends(require_admin)):
+async def update_student_status(
+    student_id: str,
+    payload: Dict[str, str],
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
     status = payload.get("status")
     if status not in ["active", "inactive"]:
         raise HTTPException(status_code=400, detail="Status harus active atau inactive")
@@ -3250,7 +4717,11 @@ async def update_student_status(student_id: str, payload: Dict[str, str], _: Dic
 
 
 @api_router.post("/students/{student_id}/reset-password")
-async def reset_student_password(student_id: str, payload: ResetPasswordInput, _: Dict[str, Any] = Depends(require_admin)):
+async def reset_student_password(
+    student_id: str,
+    payload: ResetPasswordInput,
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
     student = await db.users.find_one({"id": student_id, "role": "student"}, {"_id": 0})
     if not student:
         raise HTTPException(status_code=404, detail="Mahasiswa tidak ditemukan")
@@ -3265,27 +4736,43 @@ async def reset_student_password(student_id: str, payload: ResetPasswordInput, _
 
 
 @api_router.get("/students")
-async def list_students(_: Dict[str, Any] = Depends(require_admin)):
-    students = await db.users.find({"role": "student"}, {"_id": 0, "password_hash": 0}).sort("name", 1).to_list(2000)
-    progress_map = await calculate_student_progress_many([s["id"] for s in students])
+async def list_students(user: Dict[str, Any] = Depends(require_admin)):
+    query: Dict[str, Any] = {"role": "student"}
+    progress_class_ids: Optional[List[str]] = None
+    if not is_campus_admin(user):
+        class_ids = await lecturer_class_ids(user)
+        progress_class_ids = class_ids
+        # Dosen dapat memilih mahasiswa aktif dari seluruh katalog kampus.
+        # Mahasiswa nonaktif tetap dikembalikan hanya bila sudah ada di kelas
+        # yang dikelola dosen agar keanggotaannya tetap terlihat.
+        query["$or"] = [
+            {"status": "active"},
+            {"status": {"$exists": False}},
+            {"class_ids": {"$in": class_ids}},
+        ]
+    students = await db.users.find(query, {"_id": 0, "password_hash": 0}).sort("name", 1).to_list(2000)
+    progress_map = await calculate_student_progress_many(
+        [s["id"] for s in students], progress_class_ids
+    )
     for student in students:
         student["progress"] = progress_map.get(student["id"], {})
     return students
 
 
 @api_router.post("/students")
-async def create_student(payload: StudentInput, _: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await db.classes.find_one({"id": payload.class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+async def create_student(payload: StudentInput, user: Dict[str, Any] = Depends(require_campus_admin)):
+    class_doc = await require_class_access(payload.class_id, user)
     existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
     if existing:
         raise HTTPException(status_code=409, detail="Email mahasiswa sudah digunakan")
     student_id = new_id()
+    username = payload.nim.strip().lower()
+    if await db.users.find_one({"username": username}, {"_id": 0, "id": 1}):
+        username = f"{username}-{student_id[:6]}"
     doc = {
         "id": student_id,
         "role": "student",
-        "username": payload.nim.lower(),
+        "username": username,
         "nim": payload.nim,
         "name": payload.name,
         "email": payload.email.lower(),
@@ -3306,11 +4793,9 @@ async def import_students(
     class_id: str,
     file: UploadFile = File(...),
     default_password: str = Form(""),
-    _: Dict[str, Any] = Depends(require_admin),
+    user: Dict[str, Any] = Depends(require_campus_admin),
 ):
-    class_doc = await db.classes.find_one({"id": class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    class_doc = await require_class_access(class_id, user)
     content = await file.read()
     workbook = load_workbook(io.BytesIO(content))
     sheet = workbook.active
@@ -3349,11 +4834,14 @@ async def import_students(
         else:
             password_from_nim += 1
         student_id = new_id()
+        username = nim.lower()
+        if await db.users.find_one({"username": username}, {"_id": 0, "id": 1}):
+            username = f"{username}-{student_id[:6]}"
         await db.users.insert_one(
             {
                 "id": student_id,
                 "role": "student",
-                "username": nim.lower(),
+                "username": username,
                 "nim": nim,
                 "name": name,
                 "email": email,
@@ -3381,6 +4869,8 @@ async def list_materials(user: Dict[str, Any] = Depends(get_current_user)):
     query: Dict[str, Any] = {}
     if user["role"] == "student":
         query = {"class_id": {"$in": user.get("class_ids", [])}, "is_active": True}
+    elif user["role"] == "lecturer":
+        query = {"class_id": {"$in": await lecturer_class_ids(user)}}
     materials = await db.materials.find(query, {"_id": 0}).sort("created_at", -1).to_list(1000)
     class_ids = None if user["role"] != "student" else [material.get("class_id", "") for material in materials]
     meeting_labels = await material_meeting_label_map(class_ids)
@@ -3391,37 +4881,51 @@ async def list_materials(user: Dict[str, Any] = Depends(get_current_user)):
 
 @api_router.post("/materials")
 async def create_material(payload: MaterialInput, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await db.classes.find_one({"id": payload.class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    class_doc = await require_class_access(payload.class_id, user)
     async with _material_creation_lock:
         meeting_number = await db.materials.count_documents({"class_id": payload.class_id}) + 1
-        doc = payload.model_dump()
+        doc = normalized_material_payload(payload)
         doc.update(
             {
                 "id": new_id(),
                 "meeting": f"Pertemuan {meeting_number}",
                 "created_at": now_iso(),
                 "created_by": user["id"],
+                "lecturer_id": class_doc.get("lecturer_id", user["id"]),
+                "lecturer_name": class_doc.get("lecturer_name", user.get("name", "Dosen")),
             }
         )
         await db.materials.insert_one(doc)
     return public_doc(await enrich_material_payload(doc))
 
 
+@api_router.post("/materials/google-meet")
+async def generate_material_google_meet(payload: GoogleMeetInput, user: Dict[str, Any] = Depends(require_admin)):
+    await require_class_access(payload.class_id, user)
+    settings = await get_google_drive_settings(mask=False)
+    if not settings.get("google_meet_enabled"):
+        raise HTTPException(status_code=503, detail="Google Meet belum diaktifkan oleh Admin Kampus")
+    try:
+        meet = await asyncio.to_thread(create_google_meet_space_sync, settings, user.get("email", ""))
+    except Exception as exc:
+        logger.warning("Pembuatan Google Meet gagal: %s", exc)
+        raise HTTPException(status_code=503, detail=str(exc)[:500]) from exc
+    return {"ok": True, **meet}
+
+
 @api_router.put("/materials/{material_id}")
-async def update_material(material_id: str, payload: MaterialInput, _: Dict[str, Any] = Depends(require_admin)):
+async def update_material(material_id: str, payload: MaterialInput, user: Dict[str, Any] = Depends(require_admin)):
     existing = await db.materials.find_one({"id": material_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
-    class_doc = await db.classes.find_one({"id": payload.class_id, "status": {"$ne": "deleted"}}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    await require_class_access(existing.get("class_id", ""), user)
+    class_doc = await require_class_access(payload.class_id, user)
     existing_attachment = existing.get("attachment") if isinstance(existing.get("attachment"), dict) else {}
     attachment_id = existing_attachment.get("file_id") or existing_attachment.get("id")
     attachment_url = local_file_urls(attachment_id)["file_url"] if attachment_id else ""
     remove_attachment = bool(attachment_id and payload.file_url != attachment_url)
-    update = payload.model_dump(exclude={"meeting"})
+    update = normalized_material_payload(payload)
+    update.pop("meeting", None)
     update["updated_at"] = now_iso()
     operation: Dict[str, Any] = {"$set": update}
     if remove_attachment:
@@ -3443,12 +4947,14 @@ async def update_material(material_id: str, payload: MaterialInput, _: Dict[str,
 @api_router.post("/materials/{material_id}/attachment")
 async def upload_material_attachment(
     material_id: str,
+    background_tasks: BackgroundTasks,
     attachment: UploadFile = File(...),
     user: Dict[str, Any] = Depends(require_admin),
 ):
     material = await db.materials.find_one({"id": material_id}, {"_id": 0})
     if not material:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
+    await require_class_access(material.get("class_id", ""), user)
     ext = attachment.filename.rsplit(".", 1)[-1].lower() if attachment.filename and "." in attachment.filename else ""
     allowed = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "txt", "zip", "png", "jpg", "jpeg", "webp"}
     if ext not in allowed:
@@ -3474,7 +4980,9 @@ async def upload_material_attachment(
         user.get("name", "Dosen"),
         user["id"],
         record_type="material_attachment",
-        sync_drive=False,
+        background_tasks=background_tasks,
+        async_drive=True,
+        lecturer_id=class_doc.get("lecturer_id", ""),
     )
     await db.stored_files.update_one(
         {"id": file_doc["id"]},
@@ -3495,10 +5003,12 @@ async def upload_material_attachment(
 
 
 @api_router.delete("/materials/{material_id}")
-async def delete_material(material_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def delete_material(material_id: str, user: Dict[str, Any] = Depends(require_admin)):
     existing = await db.materials.find_one({"id": material_id}, {"_id": 0, "id": 1, "attachment": 1})
     if not existing:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
+    full_material = await db.materials.find_one({"id": material_id}, {"_id": 0, "class_id": 1}) or {}
+    await require_class_access(full_material.get("class_id", ""), user)
     comments = await db.comments.find({"material_id": material_id}, {"_id": 0, "attachment.id": 1, "attachment.file_id": 1}).to_list(5000)
     attachment_ids = []
     for comment in comments:
@@ -3545,6 +5055,8 @@ async def discussion_material_for_user(material_id: str, user: Dict[str, Any]) -
     if user.get("role") == "student":
         if material.get("class_id") not in user.get("class_ids", []) or not material.get("is_active", True):
             raise HTTPException(status_code=403, detail="Diskusi hanya dapat diakses anggota kelas")
+    elif user.get("role") == "lecturer":
+        await require_class_access(material.get("class_id", ""), user)
     return material
 
 
@@ -3562,7 +5074,7 @@ async def list_comments(material_id: str, user: Dict[str, Any] = Depends(get_cur
     comments = await db.comments.find({"material_id": material_id}, {"_id": 0}).sort("created_at", 1).to_list(1000)
     admin_author_ids = list(set(
         c.get("author_id", "") for c in comments
-        if c.get("author_role") == "admin" and c.get("author_id")
+        if c.get("author_role") in {"admin", "lecturer"} and c.get("author_id")
     ))
     admin_users_map: Dict[str, Dict[str, Any]] = {}
     if admin_author_ids:
@@ -3570,7 +5082,7 @@ async def list_comments(material_id: str, user: Dict[str, Any] = Depends(get_cur
         admin_users_map = {u["id"]: u for u in admin_docs}
     displayed_admin_names: Dict[str, str] = {}
     for comment in comments:
-        if comment.get("author_role") != "admin":
+        if comment.get("author_role") not in {"admin", "lecturer"}:
             continue
         author_id = comment.get("author_id", "")
         if author_id not in displayed_admin_names:
@@ -3642,6 +5154,7 @@ async def create_material_comment_with_image(
             user["id"],
             record_type="comment_attachment",
             sync_drive=False,
+            lecturer_id=material.get("lecturer_id", ""),
         )
         await db.stored_files.update_one(
             {"id": attachment_doc["id"]},
@@ -3664,7 +5177,9 @@ async def create_material_comment_with_image(
 
 
 @api_router.post("/comments/{comment_id}/pin")
-async def pin_comment(comment_id: str, _: Dict[str, Any] = Depends(require_admin)):
+async def pin_comment(comment_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    comment = await db.comments.find_one({"id": comment_id}, {"_id": 0, "material_id": 1}) or {}
+    await discussion_material_for_user(comment.get("material_id", ""), user)
     await db.comments.update_one({"id": comment_id}, {"$set": {"is_pinned": True}})
     return {"ok": True}
 
@@ -3675,6 +5190,8 @@ async def list_assignments(background_tasks: BackgroundTasks, user: Dict[str, An
     query: Dict[str, Any] = {}
     if user["role"] == "student":
         query = {"class_id": {"$in": user.get("class_ids", [])}, "is_active": True}
+    elif user["role"] == "lecturer":
+        query = {"class_id": {"$in": await lecturer_class_ids(user)}}
     assignments = await db.assignments.find(query, {"_id": 0}).sort("deadline", 1).to_list(1000)
     settings = await get_app_settings_cached()
     creator_ids = [item.get("created_by") for item in assignments if item.get("created_by")]
@@ -3707,9 +5224,7 @@ async def list_assignments(background_tasks: BackgroundTasks, user: Dict[str, An
 
 @api_router.post("/assignments")
 async def create_assignment(payload: AssignmentInput, background_tasks: BackgroundTasks, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await db.classes.find_one({"id": payload.class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    class_doc = await require_class_access(payload.class_id, user)
     doc = payload.model_dump()
     doc["attachment_link"] = str(doc.get("attachment_link") or "").strip()
     doc["max_file_size_mb"] = assignment_max_file_size_mb(doc)
@@ -3721,8 +5236,7 @@ async def create_assignment(payload: AssignmentInput, background_tasks: Backgrou
     deadline = parse_iso_datetime(doc["deadline"])
     if publish_at and deadline and publish_at > deadline:
         raise HTTPException(status_code=400, detail="Jadwal tayang tidak boleh setelah deadline")
-    settings = await db.app_settings.find_one({"id": "main"}, {"_id": 0}) or {}
-    lecturer_name = str(settings.get("lecturer_name") or user.get("name") or "Dosen").strip()
+    lecturer_name = str(user.get("name") or class_doc.get("lecturer_name") or "Dosen").strip()
     if lecturer_name.lower() == "dosen admin":
         lecturer_name = str(user.get("name") or "Dosen").strip()
     if lecturer_name.lower() == "dosen admin":
@@ -3733,7 +5247,7 @@ async def create_assignment(payload: AssignmentInput, background_tasks: Backgrou
             "course_id": class_doc["course_id"],
             "course_name": class_doc.get("course_name", ""),
             "class_name": class_doc["name"],
-            "lecturer_id": user["id"],
+            "lecturer_id": class_doc.get("lecturer_id", user["id"]),
             "lecturer_name": lecturer_name,
             "created_at": now_iso(),
             "created_by": user["id"],
@@ -3760,9 +5274,8 @@ async def update_assignment(
     existing = await db.assignments.find_one({"id": assignment_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
-    class_doc = await db.classes.find_one({"id": payload.class_id}, {"_id": 0})
-    if not class_doc:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    await require_class_access(existing.get("class_id", ""), user)
+    class_doc = await require_class_access(payload.class_id, user)
     doc = payload.model_dump()
     doc["attachment_link"] = str(doc.get("attachment_link") or "").strip()
     doc["max_file_size_mb"] = assignment_max_file_size_mb(doc)
@@ -3823,6 +5336,7 @@ async def upload_assignment_attachments(
     assignment = await db.assignments.find_one({"id": assignment_id}, {"_id": 0})
     if not assignment:
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
+    await require_class_access(assignment.get("class_id", ""), user)
     _, files = await multipart_uploads(request, ["files", "file", "files[]"])
     if not files:
         raise HTTPException(status_code=400, detail="Minimal satu lampiran soal harus diunggah")
@@ -3856,6 +5370,7 @@ async def upload_assignment_attachments(
             record_type="assignment_attachment",
             background_tasks=background_tasks,
             async_drive=True,
+            lecturer_id=assignment.get("lecturer_id", class_doc.get("lecturer_id", "")),
         )
         saved.append(file_doc)
     await db.assignments.update_one({"id": assignment_id}, {"$push": {"attachments": {"$each": saved}}})
@@ -3868,6 +5383,8 @@ async def list_submissions(user: Dict[str, Any] = Depends(get_current_user)):
     query: Dict[str, Any] = {}
     if user["role"] == "student":
         query = {"student_id": user["id"]}
+    elif user["role"] == "lecturer":
+        query = {"class_id": {"$in": await lecturer_class_ids(user)}}
     submissions = await db.submissions.find(query, {"_id": 0}).sort("submitted_at", -1).to_list(2000)
     for item in submissions:
         if isinstance(item.get("grade"), (int, float)) and not item.get("grade_predicate"):
@@ -3919,8 +5436,12 @@ async def chat_contacts(q: str = "", user: Dict[str, Any] = Depends(get_current_
 async def chat_lecturers(user: Dict[str, Any] = Depends(get_current_user)):
     if user.get("role") != "student":
         return []
+    class_docs = await db.classes.find(
+        {"id": {"$in": user.get("class_ids", [])}, "status": {"$ne": "deleted"}}, {"_id": 0, "lecturer_id": 1}
+    ).to_list(1000)
+    lecturer_ids = list({item.get("lecturer_id") for item in class_docs if item.get("lecturer_id")})
     lecturers = await db.users.find(
-        {"role": "admin", "status": {"$ne": "deleted"}},
+        {"id": {"$in": lecturer_ids}, "role": {"$in": ["admin", "lecturer"]}, "status": {"$ne": "deleted"}},
         {"_id": 0, "password_hash": 0},
     ).sort("name", 1).to_list(100)
     return [
@@ -4039,6 +5560,16 @@ async def stored_file_context(file_id: str, token: str = "", authorization: Opti
             material_class_id = material.get("class_id", "")
         if not material_class_id or material_class_id not in user.get("class_ids", []):
             raise HTTPException(status_code=403, detail="Lampiran materi hanya untuk anggota kelas")
+    if user.get("role") == "lecturer" and file_doc.get("record_type") != "chat_image":
+        academic_class_id = file_doc.get("material_class_id") or file_doc.get("discussion_class_id") or file_doc.get("class_id", "")
+        if not academic_class_id and file_doc.get("submission_id"):
+            submission = await db.submissions.find_one({"id": file_doc["submission_id"]}, {"_id": 0, "class_id": 1}) or {}
+            academic_class_id = submission.get("class_id", "")
+        if not academic_class_id and file_doc.get("assignment_id"):
+            assignment = await db.assignments.find_one({"id": file_doc["assignment_id"]}, {"_id": 0, "class_id": 1}) or {}
+            academic_class_id = assignment.get("class_id", "")
+        if academic_class_id:
+            await require_class_access(academic_class_id, user)
     local_path = file_doc.get("local_path", "")
     if not local_path:
         raise HTTPException(status_code=404, detail="File lokal belum tersedia")
@@ -4171,6 +5702,7 @@ async def submit_assignment(
             "submission",
             background_tasks=background_tasks,
             async_drive=True,
+            lecturer_id=assignment.get("lecturer_id", class_doc.get("lecturer_id", "")),
         )
         saved_files.append(file_doc)
     revision_count = int(submission.get("revision_count", 0)) + 1 if submission else 0
@@ -4184,6 +5716,8 @@ async def submit_assignment(
         "student_name": user["name"],
         "student_nim": user.get("nim", ""),
         "class_id": assignment["class_id"],
+        "lecturer_id": assignment.get("lecturer_id", class_doc.get("lecturer_id", "")),
+        "lecturer_name": assignment.get("lecturer_name", class_doc.get("lecturer_name", "")),
         "status": status,
         "review_status": "submitted",
         "note": note,
@@ -4204,6 +5738,8 @@ async def submit_assignment(
         {
             "id": new_id(),
             "assignment_id": assignment_id,
+            "class_id": assignment["class_id"],
+            "lecturer_id": assignment.get("lecturer_id", class_doc.get("lecturer_id", "")),
             "student_id": user["id"],
             "reminder_type": "konfirmasi_submit",
             "sent_at": now_iso(),
@@ -4221,9 +5757,7 @@ async def grade_submission(
     background_tasks: BackgroundTasks,
     user: Dict[str, Any] = Depends(require_admin),
 ):
-    submission = await db.submissions.find_one({"id": submission_id}, {"_id": 0})
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission tidak ditemukan")
+    submission = await require_submission_access(submission_id, user)
     assignment = await db.assignments.find_one({"id": submission["assignment_id"]}, {"_id": 0}) or {}
     weighted = sum((item.score * item.weight) / 100 for item in payload.rubric_scores)
     penalty = 0.0
@@ -4284,6 +5818,7 @@ async def grade_submission(
 
 @api_router.post("/submissions/{submission_id}/review")
 async def review_submission(submission_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    await require_submission_access(submission_id, user)
     await db.submissions.update_one(
         {"id": submission_id},
         {"$set": {"review_status": "reviewed", "reviewed_at": now_iso(), "reviewed_by": user["id"]}},
@@ -4301,9 +5836,7 @@ async def request_revision(
     background_tasks: BackgroundTasks,
     user: Dict[str, Any] = Depends(require_admin),
 ):
-    submission = await db.submissions.find_one({"id": submission_id}, {"_id": 0})
-    if not submission:
-        raise HTTPException(status_code=404, detail="Submission tidak ditemukan")
+    submission = await require_submission_access(submission_id, user)
     await db.submissions.update_one(
         {"id": submission_id},
         {
@@ -4341,8 +5874,9 @@ async def bulk_grade_submissions(
 ):
     results = []
     for item in payload.grades:
-        submission = await db.submissions.find_one({"id": item.submission_id}, {"_id": 0})
-        if not submission:
+        try:
+            submission = await require_submission_access(item.submission_id, user)
+        except HTTPException:
             results.append({"submission_id": item.submission_id, "status": "not_found"})
             continue
         assignment = await db.assignments.find_one({"id": submission["assignment_id"]}, {"_id": 0}) or {}
@@ -4491,14 +6025,19 @@ def _compute_student_progress(
     }
 
 
-async def calculate_student_progress_many(student_ids: List[str]) -> Dict[str, Dict[str, Any]]:
+async def calculate_student_progress_many(
+    student_ids: List[str], scoped_class_ids: Optional[List[str]] = None
+) -> Dict[str, Dict[str, Any]]:
     if not student_ids:
         return {}
     students = await db.users.find({"id": {"$in": student_ids}, "role": "student"}, {"_id": 0}).to_list(len(student_ids) * 2)
     students_map: Dict[str, Dict[str, Any]] = {s["id"]: s for s in students}
     all_class_ids: set = set()
     for s in students:
-        all_class_ids.update(s.get("class_ids", []))
+        student_classes = s.get("class_ids", [])
+        if scoped_class_ids is not None:
+            student_classes = [class_id for class_id in student_classes if class_id in scoped_class_ids]
+        all_class_ids.update(student_classes)
     all_assignments: List[Dict[str, Any]] = []
     if all_class_ids:
         all_assignments = await db.assignments.find(
@@ -4522,10 +6061,18 @@ async def calculate_student_progress_many(student_ids: List[str]) -> Dict[str, D
     for sid in student_ids:
         student = students_map.get(sid, {})
         student_class_ids = student.get("class_ids", [])
+        if scoped_class_ids is not None:
+            student_class_ids = [class_id for class_id in student_class_ids if class_id in scoped_class_ids]
         student_assignments = []
         for cid in student_class_ids:
             student_assignments.extend(class_to_assignments.get(cid, []))
         student_subs = subs_by_student.get(sid, [])
+        if scoped_class_ids is not None:
+            student_subs = [
+                submission
+                for submission in student_subs
+                if submission.get("class_id") in scoped_class_ids
+            ]
         result[sid] = _compute_student_progress(student, student_assignments, student_subs)
     return result
 
@@ -4534,21 +6081,35 @@ async def calculate_student_progress_many(student_ids: List[str]) -> Dict[str, D
 async def progress(user: Dict[str, Any] = Depends(get_current_user)):
     if user["role"] == "student":
         return {"student": public_doc(user.copy()), "progress": await calculate_student_progress(user["id"])}
-    students = await db.users.find({"role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
-    progress_map = await calculate_student_progress_many([s["id"] for s in students])
+    class_ids = await lecturer_class_ids(user)
+    student_ids = list({
+        student_id
+        for item in await db.classes.find({"id": {"$in": class_ids}}, {"_id": 0, "student_ids": 1}).to_list(5000)
+        for student_id in item.get("student_ids", [])
+    })
+    students = await db.users.find({"id": {"$in": student_ids}, "role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
+    progress_map = await calculate_student_progress_many([s["id"] for s in students], class_ids)
     for student in students:
         student["progress"] = progress_map.get(student["id"], {})
     return students
 
 
 @api_router.get("/grade-predicates")
-async def get_grade_predicates(class_id: str = "", _: Dict[str, Any] = Depends(require_admin)):
+async def get_grade_predicates(class_id: str = "", user: Dict[str, Any] = Depends(require_admin)):
+    if class_id:
+        await require_class_access(class_id, user)
+    elif user.get("role") == "lecturer":
+        return {"class_id": "", "predicates": DEFAULT_GRADE_PREDICATES}
     predicates = await get_grade_predicates_for_class(class_id)
     return {"class_id": class_id, "predicates": predicates}
 
 
 @api_router.put("/grade-predicates")
 async def save_grade_predicates(payload: GradePredicateInput, user: Dict[str, Any] = Depends(require_admin)):
+    if payload.class_id:
+        await require_class_access(payload.class_id, user)
+    elif user.get("role") == "lecturer":
+        raise HTTPException(status_code=400, detail="Dosen harus memilih kelas untuk menyimpan predikat")
     predicates = validate_grade_predicates([item.model_dump() for item in payload.predicates])
     doc = {
         "id": payload.class_id or "global",
@@ -4566,13 +6127,15 @@ async def calendar(user: Dict[str, Any] = Depends(get_current_user)):
     class_filter: Dict[str, Any] = {}
     if user["role"] == "student":
         class_filter = {"class_id": {"$in": user.get("class_ids", [])}}
+    elif user["role"] == "lecturer":
+        class_filter = {"class_id": {"$in": await lecturer_class_ids(user)}}
     assignments = await db.assignments.find({**class_filter, "is_active": True}, {"_id": 0}).to_list(1000)
     if user["role"] == "student":
         assignments = [assignment for assignment in assignments if assignment_is_published(assignment)]
     materials = await db.materials.find(class_filter, {"_id": 0}).to_list(1000)
     events = []
     for assignment in assignments:
-        if user["role"] == "admin" and assignment.get("published_at") and not assignment_is_published(assignment):
+        if user["role"] in {"admin", "lecturer"} and assignment.get("published_at") and not assignment_is_published(assignment):
             events.append(
                 {
                     "id": f"{assignment['id']}-publish",
@@ -4600,9 +6163,20 @@ async def calendar(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @api_router.post("/reminders/send")
-async def send_reminder(payload: ReminderInput, _: Dict[str, Any] = Depends(require_admin)):
+async def send_reminder(payload: ReminderInput, user: Dict[str, Any] = Depends(require_admin)):
+    assignment = await db.assignments.find_one({"id": payload.assignment_id}, {"_id": 0})
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
+    class_doc = await require_class_access(assignment.get("class_id", ""), user)
     doc = payload.model_dump()
-    doc.update({"id": new_id(), "sent_at": now_iso(), "status": "in_app", "response": "Reminder tersimpan di aplikasi"})
+    doc.update({
+        "id": new_id(),
+        "class_id": assignment.get("class_id", ""),
+        "lecturer_id": class_doc.get("lecturer_id", user["id"]),
+        "sent_at": now_iso(),
+        "status": "in_app",
+        "response": "Reminder tersimpan di aplikasi",
+    })
     await db.reminder_logs.insert_one(doc)
     return public_doc(doc)
 
@@ -4612,6 +6186,8 @@ async def list_reminders(user: Dict[str, Any] = Depends(get_current_user)):
     query: Dict[str, Any] = {}
     if user["role"] == "student":
         query = {"student_id": user["id"]}
+    elif user["role"] == "lecturer":
+        query = {"class_id": {"$in": await lecturer_class_ids(user)}}
     reminders = await db.reminder_logs.find(query, {"_id": 0}).sort("sent_at", -1).to_list(1000)
     if user["role"] == "student":
         assignment_ids = [item.get("assignment_id") for item in reminders if item.get("assignment_id")]
@@ -4623,8 +6199,10 @@ async def list_reminders(user: Dict[str, Any] = Depends(get_current_user)):
 
 
 @api_router.get("/reports/grades.xlsx")
-async def export_grades(_: Dict[str, Any] = Depends(require_admin)):
-    submissions = await db.submissions.find({}, {"_id": 0}).sort("student_name", 1).to_list(5000)
+async def export_grades(user: Dict[str, Any] = Depends(require_admin)):
+    submissions = await db.submissions.find(
+        {"class_id": {"$in": await lecturer_class_ids(user)}}, {"_id": 0}
+    ).sort("student_name", 1).to_list(5000)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Rekap Nilai"
@@ -4654,10 +6232,13 @@ async def export_grades(_: Dict[str, Any] = Depends(require_admin)):
 
 
 @api_router.get("/reports/summary")
-async def report_summary(_: Dict[str, Any] = Depends(require_admin)):
-    students = await db.users.find({"role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
-    submissions = await db.submissions.find({}, {"_id": 0}).to_list(5000)
-    assignments = await db.assignments.find({}, {"_id": 0}).to_list(1000)
+async def report_summary(user: Dict[str, Any] = Depends(require_admin)):
+    class_ids = await lecturer_class_ids(user)
+    class_docs = await db.classes.find({"id": {"$in": class_ids}}, {"_id": 0, "student_ids": 1}).to_list(5000)
+    student_ids = list({student_id for item in class_docs for student_id in item.get("student_ids", [])})
+    students = await db.users.find({"id": {"$in": student_ids}, "role": "student"}, {"_id": 0, "password_hash": 0}).to_list(2000)
+    submissions = await db.submissions.find({"class_id": {"$in": class_ids}}, {"_id": 0}).to_list(5000)
+    assignments = await db.assignments.find({"class_id": {"$in": class_ids}}, {"_id": 0}).to_list(1000)
     return {
         "total_students": len(students),
         "total_assignments": len(assignments),
@@ -4668,10 +6249,13 @@ async def report_summary(_: Dict[str, Any] = Depends(require_admin)):
 
 
 @api_router.get("/reports/grade-recap")
-async def grade_recap(class_id: Optional[str] = None, _: Dict[str, Any] = Depends(require_admin)):
-    query = {} if not class_id else {"class_id": class_id}
+async def grade_recap(class_id: Optional[str] = None, user: Dict[str, Any] = Depends(require_admin)):
+    class_ids = await lecturer_class_ids(user)
+    if class_id and class_id not in class_ids:
+        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    query = {"class_id": class_id} if class_id else {"class_id": {"$in": class_ids}}
     submissions = await db.submissions.find({**query, "grade": {"$ne": None}}, {"_id": 0}).to_list(5000)
-    classes = await db.classes.find({}, {"_id": 0}).to_list(500)
+    classes = await db.classes.find({"id": {"$in": class_ids}}, {"_id": 0}).to_list(500)
     class_map = {c["id"]: c for c in classes}
 
     class_groups: Dict[str, Any] = {}
@@ -4756,7 +6340,7 @@ async def get_public_settings():
 
 
 @api_router.put("/settings")
-async def update_settings(payload: AppSettingsInput, user: Dict[str, Any] = Depends(require_admin)):
+async def update_settings(payload: AppSettingsInput, user: Dict[str, Any] = Depends(require_campus_admin)):
     doc = payload.model_dump()
     doc.update({"id": "main", "updated_at": now_iso(), "updated_by": user["id"]})
     await db.app_settings.update_one({"id": "main"}, {"$set": doc}, upsert=True)
@@ -4765,8 +6349,10 @@ async def update_settings(payload: AppSettingsInput, user: Dict[str, Any] = Depe
 
 
 @api_router.post("/academic-years/rollover-preview")
-async def rollover_preview(_: Dict[str, Any] = Depends(require_admin)):
-    classes = await db.classes.find({"status": "active"}, {"_id": 0}).to_list(500)
+async def rollover_preview(user: Dict[str, Any] = Depends(require_admin)):
+    classes = await db.classes.find(
+        {"id": {"$in": await lecturer_class_ids(user)}, "status": "active"}, {"_id": 0}
+    ).to_list(500)
     return {
         "recommended_flow": [
             "Export rekap nilai dan arsip kelas semester lama.",
@@ -4821,8 +6407,12 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.on_event("startup")
 async def on_startup():
+    global _database_backup_scheduler_task
+    await db.connect()
     await seed_data()
+    await load_oidc_runtime_settings()
     await ensure_program_course_links()
+    await ensure_multi_lecturer_schema()
     await db.users.update_one({"email": "dosen@demo.id", "username": {"$exists": False}}, {"$set": {"username": "dosenadmin", "whatsapp": "628000000001"}})
     async for student in db.users.find({"role": "student", "username": {"$exists": False}}, {"_id": 0, "id": 1, "nim": 1}):
         if student.get("nim"):
@@ -4838,23 +6428,61 @@ async def on_startup():
         if material:
             await db.assignments.update_one({"id": assignment["id"]}, {"$set": {"material_id": material["id"]}})
     await db.users.create_index("email", unique=True)
+    await db.users.create_index("username", unique=True, sparse=True)
+    await db.users.create_index("name")
+    await db.users.create_index([("sso_issuer", 1), ("sso_subject", 1)], unique=True, sparse=True)
     await db.sessions.create_index("token", unique=True)
+    await db.database_backups.create_index("created_at")
+    await db.oidc_flows.create_index("state_hash", unique=True)
+    await db.oidc_flows.create_index("expires_at", expireAfterSeconds=0)
+    await db.oidc_login_tickets.create_index("ticket_hash", unique=True)
+    await db.oidc_login_tickets.create_index("expires_at", expireAfterSeconds=0)
     await db.chat_messages.create_index([("conversation_id", 1), ("created_at", 1)])
     await db.assignments.create_index("class_id")
     await db.assignments.create_index([("is_active", 1), ("published_at", 1)])
+    await db.assignments.create_index("deadline")
     await db.submissions.create_index([("assignment_id", 1), ("student_id", 1)])
     await db.submissions.create_index("student_id")
+    await db.submissions.create_index("submitted_at")
+    await db.submissions.create_index("student_name")
     await db.materials.create_index("class_id")
+    await db.materials.create_index("created_at")
     await db.classes.create_index("class_code")
     await db.classes.create_index("status")
+    await db.classes.create_index([("lecturer_id", 1), ("status", 1)])
+    await db.classes.create_index("created_at")
+    await db.programs.create_index("created_at")
+    await db.courses.create_index("created_at")
+    await db.materials.create_index("lecturer_id")
+    await db.submissions.create_index("lecturer_id")
     await db.stored_files.create_index("drive_sync_status")
     await db.stored_files.create_index("record_type")
+    await db.stored_files.create_index("lecturer_id")
+    await db.stored_files.create_index("uploaded_at")
     await db.comments.create_index("material_id")
+    await db.comments.create_index("created_at")
     await db.enrollment_requests.create_index([("class_id", 1), ("student_id", 1)])
+    await db.enrollment_requests.create_index("requested_at")
     await db.reminder_logs.create_index("assignment_id")
+    await db.reminder_logs.create_index("sent_at")
     await db.whatsapp_messages.create_index("status")
+    await db.whatsapp_messages.create_index("created_at")
+    await db.password_reset_requests.create_index("requested_at")
+    _database_backup_scheduler_task = asyncio.create_task(database_backup_scheduler())
+
+
+@app.on_event("shutdown")
+async def on_shutdown():
+    global _database_backup_scheduler_task
+    if _database_backup_scheduler_task:
+        _database_backup_scheduler_task.cancel()
+        try:
+            await _database_backup_scheduler_task
+        except asyncio.CancelledError:
+            pass
+        _database_backup_scheduler_task = None
 
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    await db.close()
