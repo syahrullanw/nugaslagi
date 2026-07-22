@@ -6,13 +6,6 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
-### Repository dan backup
-
-- Menetapkan `https://github.com/syahrullanw/nugaslagi.git` sebagai remote resmi dan sumber histori aplikasi.
-- Menambahkan aturan branch, commit konvensional, Pull Request, release, tag, perlindungan credential, serta deployment berbasis commit/tag.
-- Menambahkan script pemeriksaan/push backup dan release yang tidak melakukan stage atau commit otomatis.
-- Menambahkan template Pull Request dan workflow GitHub Actions untuk compile/test backend serta build frontend.
-
 ## [1.0.1] — 2026-07-22
 
 ### Hak akses mahasiswa
@@ -24,6 +17,13 @@ Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database
 - Perubahan status akun dan reset password mahasiswa dibatasi untuk admin kampus; dosen tetap dapat mengelola keanggotaan kelas.
 - Form tambah mahasiswa dan import Excel disembunyikan dari UI dosen, sementara pencarian serta aksi memasukkan mahasiswa aktif tetap tersedia.
 - Tidak ada perubahan skema database; versi skema tetap `002_domain_tables`.
+
+### Repository dan backup
+
+- Menetapkan `https://github.com/syahrullanw/nugaslagi.git` sebagai remote resmi dan sumber histori aplikasi.
+- Menambahkan aturan branch, commit konvensional, Pull Request, release, tag, perlindungan credential, serta deployment berbasis commit/tag.
+- Menambahkan script pemeriksaan/push backup dan release yang tidak melakukan stage atau commit otomatis.
+- Menambahkan template Pull Request dan workflow GitHub Actions untuk compile/test backend serta build frontend.
 
 ## [1.0.0] — 2026-07-22
 
@@ -62,16 +62,17 @@ Rilis baseline untuk operasional PostgreSQL dan pelacakan upgrade.
 
 ## Riwayat Git yang dapat diverifikasi
 
-Riwayat formal di repository saat changelog ini dibuat hanya memiliki dua commit berikut:
+Riwayat formal yang dapat diverifikasi di repository:
 
 | Tanggal | Commit | Ringkasan |
 | --- | --- | --- |
 | 2026-07-20 | `28636a8` | `feat: add visual grade recap per course with Recharts charts` — baseline aplikasi dan rekap nilai visual. |
 | 2026-07-20 | `9272451` | `chore: include frontend build output for deployment` — memasukkan hasil build frontend untuk deployment. |
+| 2026-07-22 | `d24f393` | `release: v1.0.1 PostgreSQL and access-control baseline` — baseline PostgreSQL, permission mahasiswa, versioning, dan workflow GitHub. |
 
 ## Perubahan working tree yang dipetakan sebelum `1.0.0`
 
-Bagian ini sengaja tidak diberi SHA karena perubahan tersebut masih berupa perubahan working tree/uncommitted ketika inventaris dibuat. Daftar ini menjadi peta upgrade, bukan klaim bahwa semuanya sudah menjadi rilis Git terpisah.
+Bagian ini sengaja tidak diberi SHA per fitur karena perubahan tersebut masih berupa working tree/uncommitted ketika inventaris awal dibuat. Seluruh baseline tersebut kemudian dibakukan dalam commit `d24f393`.
 
 - **Identitas dan akses:** integrasi SSO SCI-ID/OIDC, login lokal, logout, registrasi, lupa/reset password, OTP email/WhatsApp, serta konfigurasi provider.
 - **Tenancy dan peran:** dukungan multi-lecturer, admin kampus, dosen, mahasiswa, enrollment kelas, dan isolasi data per tenant.
