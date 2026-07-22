@@ -6,6 +6,10 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+### Continuous integration
+
+- Memperbarui GitHub Actions ke runtime Node 24 dan menyesuaikan instalasi frontend agar peer dependency proyek dapat dipasang secara konsisten di CI.
+
 ## [1.0.1] — 2026-07-22
 
 ### Hak akses mahasiswa
