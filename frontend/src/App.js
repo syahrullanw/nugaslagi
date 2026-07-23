@@ -57,7 +57,9 @@ import {
   ImagePlus,
   Minus,
   Paperclip,
+  Printer,
   Reply,
+  RotateCcw,
   Search,
   Smile,
   Video,
@@ -65,8 +67,12 @@ import {
 } from "lucide-react";
 
 import {
+  Area,
+  AreaChart,
   BarChart,
   Bar,
+  Pie,
+  PieChart,
   XAxis,
   YAxis,
   CartesianGrid,
@@ -90,6 +96,12 @@ const DEFAULT_SUBMISSION_FORMATS = [
   "jpg",
   "jpeg",
   "webp",
+];
+const DEFAULT_GRADE_WEIGHTS = { tugas: 25, uts: 35, uas: 40 };
+const GRADE_WEIGHT_COMPONENTS = [
+  { key: "tugas", label: "Tugas", description: "Rata-rata seluruh tugas" },
+  { key: "uts", label: "UTS", description: "Nilai ujian tengah semester" },
+  { key: "uas", label: "UAS", description: "Nilai ujian akhir semester" },
 ];
 
 const logoUrl = "/app-icon.svg";
@@ -362,6 +374,13 @@ function driveSyncLabel(status) {
   if (status === "failed") return "Sinkron Drive gagal";
   if (status === "not_configured") return "Drive belum aktif";
   return status || "Belum ada status Drive";
+}
+
+function reviewStatusLabel(status) {
+  if (status === "graded") return "Sudah dinilai";
+  if (status === "reviewed") return "Sudah dilihat";
+  if (status === "revision_requested") return "Menunggu revisi";
+  return "Perlu ditinjau";
 }
 
 function formatBytes(bytes) {
@@ -2697,6 +2716,148 @@ function GradePredicatePage({
   );
 }
 
+const GradeWeightsPage = memo(function GradeWeightsPage({
+  courses,
+  classes,
+  isCampusAdmin,
+  saveGradeWeights,
+  resetGradeWeights,
+}) {
+  const manageableCourseIds = useMemo(
+    () =>
+      isCampusAdmin
+        ? new Set((courses || []).map((course) => course.id))
+        : new Set((classes || []).map((classItem) => classItem.course_id).filter(Boolean)),
+    [classes, courses, isCampusAdmin],
+  );
+  const manageableCourses = useMemo(
+    () => (courses || []).filter((course) => manageableCourseIds.has(course.id)),
+    [courses, manageableCourseIds],
+  );
+  const [selectedCourseId, setSelectedCourseId] = useState("");
+  const [weights, setWeights] = useState(DEFAULT_GRADE_WEIGHTS);
+
+  useEffect(() => {
+    if (!manageableCourses.length) {
+      setSelectedCourseId("");
+      return;
+    }
+    const selected = manageableCourses.find((course) => course.id === selectedCourseId) || manageableCourses[0];
+    if (selected.id !== selectedCourseId) setSelectedCourseId(selected.id);
+    setWeights({ ...DEFAULT_GRADE_WEIGHTS, ...(selected.grade_weights || {}) });
+  }, [manageableCourses, selectedCourseId]);
+
+  const selectedCourse = manageableCourses.find((course) => course.id === selectedCourseId);
+  const total = GRADE_WEIGHT_COMPONENTS.reduce((sum, component) => sum + Number(weights[component.key] || 0), 0);
+  const totalIsValid = Math.abs(total - 100) < 0.01;
+
+  function selectCourse(course) {
+    setSelectedCourseId(course.id);
+    setWeights({ ...DEFAULT_GRADE_WEIGHTS, ...(course.grade_weights || {}) });
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    if (!selectedCourse || !totalIsValid) return;
+    await saveGradeWeights(selectedCourse.id, weights);
+  }
+
+  return (
+    <div className="space-y-6" data-testid="grade-weights-page">
+      <section className="meeting-hero" data-testid="grade-weights-hero">
+        <div>
+          <p className="meeting-overline">Evaluasi</p>
+          <h2 className="font-display text-2xl font-semibold" data-testid="grade-weights-title">
+            Porsi bobot nilai per mata kuliah
+          </h2>
+          <p className="meeting-description">
+            Atur kontribusi Tugas, UTS, dan UAS. Jika tidak diubah, sistem memakai default 25% · 35% · 40%.
+          </p>
+        </div>
+        <div className="meeting-summary" data-testid="grade-weights-summary">
+          <div><strong>{manageableCourses.length}</strong><span>Mata kuliah</span></div>
+          <div><strong>100%</strong><span>Total wajib</span></div>
+        </div>
+      </section>
+      {!manageableCourses.length ? (
+        <EmptyState title="Belum ada mata kuliah" description="Buat atau hubungkan kelas ke mata kuliah terlebih dahulu." />
+      ) : (
+        <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]">
+          <Card className="rounded-md shadow-none" data-testid="grade-weights-course-list-card">
+            <CardHeader>
+              <CardTitle>Pilih mata kuliah</CardTitle>
+              <p className="text-sm text-slate-500">Bobot berlaku untuk semua kelas dari mata kuliah yang dipilih.</p>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {manageableCourses.map((course) => {
+                const courseWeights = course.grade_weights || DEFAULT_GRADE_WEIGHTS;
+                const active = course.id === selectedCourseId;
+                return (
+                  <button
+                    type="button"
+                    key={course.id}
+                    className={`grade-weights-course-row ${active ? "active" : ""}`}
+                    data-testid={`grade-weights-course-${course.id}-button`}
+                    onClick={() => selectCourse(course)}
+                  >
+                    <span>
+                      <strong>{course.code ? `${course.code} · ` : ""}{course.name}</strong>
+                      <small>{course.program_name || "Mata kuliah"}</small>
+                    </span>
+                    <span className="grade-weights-course-meta">
+                      <Badge className={course.grade_weights_customized ? "border-blue-200 bg-blue-50 text-blue-700" : "border-slate-200 bg-slate-50 text-slate-600"}>
+                        {course.grade_weights_customized ? "Custom" : "Default"}
+                      </Badge>
+                      <small>{courseWeights.tugas}% · {courseWeights.uts}% · {courseWeights.uas}%</small>
+                    </span>
+                  </button>
+                );
+              })}
+            </CardContent>
+          </Card>
+          <form onSubmit={submit}>
+            <Card className="rounded-md shadow-none" data-testid="grade-weights-editor-card">
+              <CardHeader>
+                <CardTitle>{selectedCourse?.name || "Atur bobot"}</CardTitle>
+                <p className="text-sm text-slate-500">Total bobot harus tepat 100%.</p>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                {GRADE_WEIGHT_COMPONENTS.map((component) => (
+                  <Field key={component.key} id={`grade-weight-${component.key}`} label={`${component.label} (%)`}>
+                    <div className="grade-weight-input-wrap">
+                      <Input
+                        id={`grade-weight-${component.key}`}
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.01"
+                        data-testid={`grade-weight-${component.key}-input`}
+                        value={weights[component.key]}
+                        onChange={(event) => setWeights((current) => ({ ...current, [component.key]: event.target.value }))}
+                      />
+                      <span>%</span>
+                    </div>
+                    <p className="mt-1 text-xs text-slate-500">{component.description}</p>
+                  </Field>
+                ))}
+                <div className={`grade-weight-total ${totalIsValid ? "valid" : "invalid"}`} data-testid="grade-weights-total">
+                  <span>Total bobot</span><strong>{Number(total.toFixed(2))}%</strong>
+                </div>
+                {!totalIsValid && <p className="text-sm text-red-700">Atur angka hingga total tepat 100%.</p>}
+                <div className="flex flex-wrap gap-2">
+                  <Button type="submit" disabled={!totalIsValid} data-testid="grade-weights-save-button"><CheckCircle2 /> Simpan bobot</Button>
+                  <Button type="button" variant="outline" data-testid="grade-weights-reset-button" onClick={() => selectedCourse && resetGradeWeights(selectedCourse.id)}><RotateCcw /> Gunakan default</Button>
+                </div>
+                <p className="text-xs text-slate-500">Default sistem: 25% Tugas, 35% UTS, 40% UAS.</p>
+              </CardContent>
+            </Card>
+          </form>
+        </div>
+      )}
+    </div>
+  );
+});
+
 function AdminApp({
   token,
   user,
@@ -2784,6 +2945,7 @@ function AdminApp({
       allowed_formats: "pdf,docx,zip,png,jpg",
       max_file_size_mb: 5,
       assignment_type: "individu",
+      assessment_category: "tugas",
       allow_revision: true,
       is_practicum: false,
       practicum_goal: "",
@@ -3023,7 +3185,10 @@ function AdminApp({
   }
   async function saveMaterial(event) {
     event.preventDefault();
+    const targetClass = data.classes.find((item) => item.id === forms.material.class_id);
+    if (targetClass && targetClass.status !== "active") return toast.error("Materi hanya dapat diubah pada kelas Aktif");
     const { id, ...payload } = forms.material;
+    if (!window.confirm(id ? "Simpan perubahan materi ini?" : "Publikasikan materi ini ke kelas aktif?")) return;
     let saved = null;
     const operation = progress.begin(
       id ? "Menyimpan perubahan pertemuan" : "Membuat pertemuan",
@@ -3141,6 +3306,8 @@ function AdminApp({
   }
   async function createAssignment(event) {
     event.preventDefault();
+    const targetClass = data.classes.find((item) => item.id === forms.assignment.class_id);
+    if (targetClass && targetClass.status !== "active") return toast.error("Tugas hanya dapat diubah pada kelas Aktif");
     const { id, ...assignmentForm } = forms.assignment;
     const allowedFormats = Array.isArray(assignmentForm.allowed_formats)
       ? assignmentForm.allowed_formats
@@ -3171,6 +3338,11 @@ function AdminApp({
         .filter(Boolean),
     };
     const editing = Boolean(id);
+    if (!window.confirm(
+      editing
+        ? `Simpan perubahan tugas ${assignmentForm.title || "ini"}?`
+        : `Buat tugas ${assignmentForm.title || "ini"} dengan deadline ${fmtDate(payload.deadline)}?`,
+    )) return;
     const operation = progress.begin(
       editing ? "Menyimpan perubahan tugas" : "Membuat tugas",
       assignmentFiles.length
@@ -3235,6 +3407,7 @@ function AdminApp({
           material_id: "",
           max_file_size_mb: DEFAULT_SUBMISSION_MAX_FILE_MB,
           assignment_type: "individu",
+          assessment_category: "tugas",
           allow_revision: true,
           is_practicum: false,
           practicum_goal: "",
@@ -3262,6 +3435,7 @@ function AdminApp({
     event.preventDefault();
     if (!importFile || !forms.student.class_id)
       return toast.error("Pilih file Excel dan kelas");
+    if (!window.confirm("Import akan membuat atau menambahkan banyak akun mahasiswa ke kelas aktif. Lanjutkan?")) return;
     const operation = progress.begin("Mengimpor mahasiswa", importFile.name);
     const fd = new FormData();
     fd.append("file", importFile);
@@ -3301,6 +3475,7 @@ function AdminApp({
     );
     const score = clampScoreInput(forms.grade.score);
     if (score === "") return toast.error("Nilai wajib diisi");
+    if (!window.confirm("Simpan nilai dan feedback untuk submission ini?")) return;
     const rubric = assignment?.rubric?.length
       ? assignment.rubric
       : [{ criterion: "Nilai total", weight: 100 }];
@@ -3332,17 +3507,20 @@ function AdminApp({
       .filter((item) => !Number.isNaN(item.score));
     if (!cleanTargets.length)
       return toast.info("Tidak ada submission yang siap dinilai");
+    if (!window.confirm(`Simpan nilai untuk ${cleanTargets.length} submission?`)) return;
     await postJson(
       "/submissions/bulk-grade",
       { grades: cleanTargets },
       "Nilai banyak mahasiswa berhasil disimpan",
     );
   }
-  async function exportGrades() {
+  async function exportGradeRecap(format = "xlsx", classId = "") {
     const operation = progress.begin("Menyiapkan export nilai");
     try {
-      const response = await axios.get(`${API}/reports/grades.xlsx`, {
+      const suffix = format === "pdf" ? "pdf" : "xlsx";
+      const response = await axios.get(`${API}/reports/grades.${suffix}`, {
         ...auth,
+        params: classId ? { class_id: classId } : undefined,
         responseType: "blob",
         onDownloadProgress: (download) =>
           progress.update(
@@ -3354,16 +3532,19 @@ function AdminApp({
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement("a");
       link.href = url;
-      link.setAttribute("download", "rekap-nilai.xlsx");
+      link.setAttribute("download", `rekap-nilai${classId ? `-${classId}` : ""}.${suffix}`);
       document.body.appendChild(link);
       link.click();
       link.remove();
-      progress.finish(operation, "Rekap nilai diunduh");
-      toast.success("Rekap nilai diunduh");
+      progress.finish(operation, `Rekap nilai ${suffix.toUpperCase()} diunduh`);
+      toast.success(`Rekap nilai ${suffix.toUpperCase()} diunduh`);
     } catch (error) {
       progress.fail(operation, "Export gagal");
       toast.error("Export gagal");
     }
+  }
+  async function exportGrades() {
+    return exportGradeRecap("xlsx");
   }
   async function sendReminder(assignmentId, studentId = "") {
     await postJson(
@@ -3379,6 +3560,11 @@ function AdminApp({
   }
   async function saveSettings(event) {
     event.preventDefault();
+    const previous = data.settings || {};
+    const periodChanged =
+      previous.active_academic_year !== forms.settings.active_academic_year ||
+      previous.active_semester !== forms.settings.active_semester;
+    if (periodChanged && !window.confirm("Ubah tahun ajaran/semester aktif? Kelas lama tidak berubah; buat kelas baru untuk periode berikutnya.")) return;
     const operation = progress.begin("Menyimpan settings");
     try {
       const { data: saved } = await axios.put(
@@ -3597,6 +3783,7 @@ function AdminApp({
     );
   }
   async function saveGradePredicates(payload) {
+    if (!window.confirm("Simpan range predikat nilai ini? Perubahan akan dipakai pada penilaian kelas aktif.")) return false;
     const operation = progress.begin("Menyimpan range predikat");
     try {
       const { data: saved } = await axios.put(
@@ -3612,11 +3799,13 @@ function AdminApp({
       await loadAll();
       progress.finish(operation, "Range predikat disimpan");
       toast.success("Range predikat disimpan");
+      return true;
     } catch (error) {
       const detail =
         error.response?.data?.detail || "Range predikat gagal disimpan";
       progress.fail(operation, detail);
       toast.error(detail);
+      return false;
     }
   }
   async function cleanDataModule(moduleKey, label) {
@@ -3647,14 +3836,19 @@ function AdminApp({
       "Submission ditandai sudah dilihat",
     );
   }
-  async function requestRevision(id) {
-    const note = window.prompt("Catatan revisi", "Silakan revisi jawaban");
-    if (note !== null)
-      await postJson(
-        `/submissions/${id}/request-revision`,
-        { revision_note: note },
-        "Permintaan revisi dikirim",
-      );
+  async function requestRevision(id, noteOverride) {
+    const note =
+      typeof noteOverride === "string"
+        ? noteOverride.trim()
+        : window.prompt("Catatan revisi", "Silakan revisi jawaban");
+    if (note === null) return;
+    if (!note) return toast.error("Catatan revisi wajib diisi");
+    if (!window.confirm("Kirim permintaan revisi kepada mahasiswa?")) return;
+    await postJson(
+      `/submissions/${id}/request-revision`,
+      { revision_note: note },
+      "Permintaan revisi dikirim",
+    );
   }
   async function saveProgram(event) {
     event.preventDefault();
@@ -3716,9 +3910,51 @@ function AdminApp({
       toast.error(detail);
     }
   }
+  async function saveGradeWeights(courseId, weights) {
+    if (!window.confirm("Simpan bobot ini? Bobot akan dipakai untuk kelas aktif; kelas yang sudah diakhiri memakai snapshot bobotnya.")) return false;
+    const operation = progress.begin("Menyimpan bobot nilai", "Memvalidasi total bobot...");
+    try {
+      const payload = {
+        tugas: Number(weights.tugas || 0),
+        uts: Number(weights.uts || 0),
+        uas: Number(weights.uas || 0),
+      };
+      await axios.put(`${API}/courses/${courseId}/grade-weights`, payload, auth);
+      await loadAll();
+      progress.finish(operation, "Bobot nilai tersimpan");
+      toast.success("Bobot nilai tersimpan");
+      return true;
+    } catch (error) {
+      const detail = formatApiError(error, "Bobot nilai gagal disimpan");
+      progress.fail(operation, detail);
+      toast.error(detail);
+      return false;
+    }
+  }
+  async function resetGradeWeights(courseId) {
+    if (!window.confirm("Kembalikan bobot mata kuliah ke default 25% Tugas, 35% UTS, 40% UAS?")) return false;
+    const operation = progress.begin("Mengembalikan bobot default");
+    try {
+      await axios.delete(`${API}/courses/${courseId}/grade-weights`, auth);
+      await loadAll();
+      progress.finish(operation, "Bobot default 25/35/40 diterapkan");
+      toast.success("Bobot default 25% Tugas, 35% UTS, 40% UAS diterapkan");
+      return true;
+    } catch (error) {
+      const detail = formatApiError(error, "Bobot default gagal diterapkan");
+      progress.fail(operation, detail);
+      toast.error(detail);
+      return false;
+    }
+  }
   async function saveClass(event) {
     event.preventDefault();
     const { id, ...payload } = forms.class;
+    if (!window.confirm(
+      id
+        ? `Simpan perubahan konfigurasi kelas ${forms.class.name || "ini"}?`
+        : `Buat kelas ${forms.class.name || "baru"} untuk ${forms.class.semester || "semester terpilih"} ${forms.class.academic_year || ""}?`,
+    )) return;
     const operation = progress.begin(
       id ? "Memperbarui kelas" : "Membuat kelas",
     );
@@ -3762,10 +3998,59 @@ function AdminApp({
     }
   }
   async function endClass(id) {
+    if (!window.confirm("Akhiri kelas ini? Mahasiswa baru, materi baru, tugas baru, dan submission baru akan ditutup. Penilaian masih dapat dilanjutkan.")) return;
     await postJson(
       `/classes/${id}/end`,
       {},
       "Kelas diakhiri dan masuk riwayat",
+    );
+  }
+  async function finalizeClass(classItem) {
+    const confirmation = window.prompt(
+      `Finalisasi nilai kelas ${classItem.name}? Ketik FINALISASI untuk mengunci rekap.`,
+      "",
+    );
+    if (confirmation === null) return;
+    await postJson(
+      `/classes/${classItem.id}/finalize`,
+      { confirmation },
+      "Nilai kelas difinalisasi dan dikunci",
+    );
+  }
+  async function archiveClass(classItem) {
+    if (!window.confirm(`Arsipkan kelas ${classItem.name}? Data akan menjadi read-only.`)) return;
+    await postJson(`/classes/${classItem.id}/archive`, {}, "Kelas diarsipkan");
+  }
+  async function duplicateClass(classItem) {
+    const academicYear = window.prompt(
+      "Tahun akademik kelas baru",
+      forms.settings.active_academic_year || "",
+    );
+    if (academicYear === null) return;
+    const semester = window.prompt(
+      "Semester kelas baru",
+      forms.settings.active_semester || "",
+    );
+    if (semester === null) return;
+    const name = window.prompt("Nama kelas baru", classItem.name || "");
+    if (name === null) return;
+    if (!academicYear.trim() || !semester.trim() || !name.trim())
+      return toast.error("Tahun akademik, semester, dan nama kelas wajib diisi");
+    const confirmation = window.prompt(
+      "Kelas baru akan kosong tanpa mahasiswa, materi, tugas, dan submission. Ketik DUPLIKASI untuk melanjutkan.",
+      "",
+    );
+    if (confirmation === null) return;
+    await postJson(
+      `/classes/${classItem.id}/duplicate`,
+      {
+        academic_year: academicYear.trim(),
+        semester: semester.trim(),
+        name: name.trim(),
+        schedule: classItem.schedule || "",
+        confirmation,
+      },
+      "Kelas periode baru dibuat dengan kode baru",
     );
   }
   async function saveLecturer(event) {
@@ -3903,6 +4188,7 @@ function AdminApp({
       label: "Evaluasi",
       items: [
         ["grading", CheckCircle2, "Penilaian"],
+        ["weights", BarChart3, "Bobot Nilai"],
         ["rekap", BarChart3, "Rekap Nilai"],
         ["predicates", CheckCircle2, "Predikat"],
         ["reports", FileSpreadsheet, "Laporan"],
@@ -3911,6 +4197,10 @@ function AdminApp({
     {
       label: "Akun",
       items: [["profile", Users, "Profil"]],
+    },
+    {
+      label: "Bantuan",
+      items: [["guide", BookOpen, "Panduan LMS"]],
     },
     ...(isCampusAdmin
       ? [
@@ -4081,7 +4371,9 @@ function AdminApp({
             <DashboardPage
               data={data}
               sendReminder={sendReminder}
-              token={token}
+              user={user}
+              isCampusAdmin={isCampusAdmin}
+              onNavigate={openAdminPage}
             />
           )}
           {page === "lecturers" && isCampusAdmin && (
@@ -4104,6 +4396,9 @@ function AdminApp({
               saveClass={saveClass}
               deleteCatalog={deleteCatalog}
               endClass={endClass}
+              finalizeClass={finalizeClass}
+              archiveClass={archiveClass}
+              duplicateClass={duplicateClass}
             />
           )}
           {page === "students" && (
@@ -4157,10 +4452,28 @@ function AdminApp({
               token={token}
             />
           )}
-          {page === "rekap" && <GradeRecapPage data={data} />}
+          {page === "weights" && (
+            <GradeWeightsPage
+              courses={data.courses}
+              classes={data.classes}
+              isCampusAdmin={isCampusAdmin}
+              saveGradeWeights={saveGradeWeights}
+              resetGradeWeights={resetGradeWeights}
+            />
+          )}
+          {page === "rekap" && (
+            <GradeRecapPage
+              data={data}
+              exportGradeRecap={exportGradeRecap}
+            />
+          )}
           {page === "calendar" && <CalendarPage events={data.calendar} />}
           {page === "reports" && (
-            <ReportsPage data={data} exportGrades={exportGrades} />
+            <ReportsPage
+              data={data}
+              exportGrades={exportGrades}
+              exportGradeRecap={exportGradeRecap}
+            />
           )}
           {page === "profile" && (
             <ProfilePage
@@ -4168,6 +4481,9 @@ function AdminApp({
               user={user}
               onUserUpdate={onUserUpdate}
             />
+          )}
+          {page === "guide" && (
+            <GuidePage role={isCampusAdmin ? "admin" : "lecturer"} classes={data.classes} onNavigate={openAdminPage} />
           )}
           {page === "settings" && isCampusAdmin && (
             <SettingsPage
@@ -4992,39 +5308,198 @@ const CleanDataPage = memo(function CleanDataPage({
 const DashboardPage = memo(function DashboardPage({
   data,
   sendReminder,
-  token,
+  user,
+  isCampusAdmin,
+  onNavigate,
 }) {
   const s = data.dashboard?.summary || {};
+  const submissions = data.submissions || [];
+  const totalSubmissions = submissions.length;
+  const gradedSubmissions = submissions.filter(isGradedSubmission).length;
+  const gradingCompletion = totalSubmissions
+    ? Math.round((gradedSubmissions / totalSubmissions) * 100)
+    : 0;
+  const pendingEnrollments = (data.enrollments || []).filter(
+    (item) => item.status === "pending",
+  ).length;
+  const riskOrder = {
+    "Risiko Tinggi": 4,
+    "Perlu Perhatian": 3,
+    "Risiko Rendah": 2,
+    Aman: 1,
+  };
+  const progressRows = [...(data.progress || [])].sort(
+    (left, right) =>
+      (riskOrder[right.progress?.risk_label] || 0) -
+        (riskOrder[left.progress?.risk_label] || 0) ||
+      (right.progress?.missing || 0) - (left.progress?.missing || 0),
+  );
+  const attentionStudents = progressRows.filter((student) =>
+    ["Risiko Tinggi", "Perlu Perhatian"].includes(
+      student.progress?.risk_label,
+    ),
+  ).length;
+  const upcomingAssignments = useMemo(
+    () =>
+      [...(data.assignments || [])]
+        .filter((item) => {
+          const deadline = new Date(item.deadline).getTime();
+          return Number.isFinite(deadline) && deadline >= Date.now() - 3600000;
+        })
+        .sort(
+          (left, right) =>
+            new Date(left.deadline).getTime() -
+            new Date(right.deadline).getTime(),
+        )
+        .slice(0, 5),
+    [data.assignments],
+  );
+  const recentSubmissions = useMemo(
+    () =>
+      [...submissions]
+        .sort(
+          (left, right) =>
+            new Date(right.submitted_at || 0).getTime() -
+            new Date(left.submitted_at || 0).getTime(),
+        )
+        .slice(0, 4),
+    [submissions],
+  );
+  const dashboardTrend = useMemo(() => {
+    const totals = new Map();
+    submissions.forEach((submission) => {
+      const key = reportDateKey(submission.submitted_at);
+      if (!key) return;
+      const current = totals.get(key) || { masuk: 0, dinilai: 0 };
+      current.masuk += 1;
+      if (isGradedSubmission(submission)) current.dinilai += 1;
+      totals.set(key, current);
+    });
+    const today = new Date();
+    today.setHours(12, 0, 0, 0);
+    return Array.from({ length: 7 }, (_, index) => {
+      const date = new Date(today);
+      date.setDate(today.getDate() - (6 - index));
+      return {
+        tanggal: reportShortDate(date),
+        ...(totals.get(reportDateKey(date)) || { masuk: 0, dinilai: 0 }),
+      };
+    });
+  }, [submissions]);
+  const latestComments = data.dashboard?.latest_comments || [];
+  const activeLecturers = (data.lecturers || []).filter(
+    (lecturer) => lecturer.status === "active",
+  ).length;
+  const greetingName = user?.name?.split(" ")?.[0] || "Pengguna";
+  const dashboardMessage =
+    Number(s.ungraded_submissions || 0) +
+    Number(s.missing_submissions || 0) +
+    attentionStudents +
+    pendingEnrollments;
+
   return (
-    <div className="space-y-6 animate-rise" data-testid="dashboard-page">
-      <div
-        className={`flex items-center gap-3 border p-4 ${s.storage_mode === "google_drive" ? "border-blue-200 bg-blue-50 text-blue-800" : "border-amber-200 bg-amber-50 text-amber-800"}`}
-        data-testid="storage-mode-info"
-      >
-        <CheckCircle2 className="h-5 w-5" />
-        <span data-testid="storage-mode-info-text">
-          {s.storage_mode === "google_drive"
-            ? `Google Drive aktif. Folder: ${s.drive_root_folder_name || "E-Learning Dosen"} / Tahun Akademik / Semester / Mata Kuliah / Kelas / Tugas / Mahasiswa.`
-            : "Google Drive belum aktif. Upload tetap disimpan aman di server lokal dengan struktur folder akademik."}
-        </span>
-      </div>
-      <div
-        className="grid gap-4 md:grid-cols-2 xl:grid-cols-4"
-        data-testid="dashboard-stat-grid"
-      >
+    <div className="dashboard-overview-page animate-rise" data-testid="dashboard-page">
+      <section className="dashboard-command-hero" data-testid="dashboard-command-hero">
+        <div className="dashboard-command-copy">
+          <p className="dashboard-command-overline">
+            {isCampusAdmin ? "Kendali akademik kampus" : "Ruang kerja dosen"}
+          </p>
+          <h2 data-testid="dashboard-welcome-title">Halo, {greetingName}</h2>
+          <p data-testid="dashboard-welcome-description">
+            {dashboardMessage > 0
+              ? `${dashboardMessage} hal perlu perhatian agar kegiatan belajar tetap berjalan lancar.`
+              : "Tidak ada antrean mendesak. Seluruh aktivitas pembelajaran dalam kondisi terkendali."}
+          </p>
+          <div className="dashboard-command-actions">
+            <Button type="button" onClick={() => onNavigate("grading")}>
+              <CheckCircle2 /> Buka penilaian
+            </Button>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => onNavigate("assignments")}
+            >
+              <ClipboardList /> Kelola tugas
+            </Button>
+            {isCampusAdmin && (
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => onNavigate("reports")}
+              >
+                <BarChart3 /> Lihat laporan
+              </Button>
+            )}
+          </div>
+        </div>
+        <div className="dashboard-command-summary">
+          <div
+            className="dashboard-completion-ring"
+            style={{ "--dashboard-progress": `${gradingCompletion * 3.6}deg` }}
+            data-testid="dashboard-grading-completion"
+          >
+            <div>
+              <strong>{gradingCompletion}%</strong>
+              <span>dinilai</span>
+            </div>
+          </div>
+          <div className="dashboard-command-facts">
+            <div>
+              <strong>{s.near_deadline || 0}</strong>
+              <span>Deadline ≤ 3 hari</span>
+            </div>
+            <div>
+              <strong>{attentionStudents}</strong>
+              <span>Mahasiswa perlu perhatian</span>
+            </div>
+            <div
+              className={
+                s.storage_mode === "google_drive" ? "is-ready" : "is-warning"
+              }
+              data-testid="storage-mode-info"
+            >
+              <CheckCircle2 />
+              <span data-testid="storage-mode-info-text">
+                {s.storage_mode === "google_drive"
+                  ? "Google Drive tersambung"
+                  : "Penyimpanan lokal aktif"}
+              </span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <div className="dashboard-metric-grid" data-testid="dashboard-stat-grid">
+        {isCampusAdmin ? (
+          <StatCard
+            icon={Users}
+            label="Dosen aktif"
+            value={activeLecturers}
+            hint="Akun pengajar kampus"
+            testid="stat-active-lecturers"
+          />
+        ) : (
+          <StatCard
+            icon={BookOpen}
+            label="Mata kuliah"
+            value={s.active_courses || 0}
+            hint="Dalam tanggung jawab Anda"
+            testid="stat-active-courses"
+          />
+        )}
         <StatCard
           icon={BookOpen}
-          label="Mata kuliah aktif"
-          value={s.active_courses || 0}
-          hint="Siap untuk semester berjalan"
-          testid="stat-active-courses"
+          label="Kelas aktif"
+          value={s.active_classes || 0}
+          hint={`${s.active_courses || 0} mata kuliah berjalan`}
+          testid="stat-active-classes"
         />
         <StatCard
           icon={Users}
-          label="Kelas aktif"
-          value={s.active_classes || 0}
-          hint="Termasuk kode kelas mahasiswa"
-          testid="stat-active-classes"
+          label="Mahasiswa"
+          value={progressRows.length}
+          hint="Terdaftar pada kelas aktif"
+          testid="stat-dashboard-students"
         />
         <StatCard
           icon={ClipboardList}
@@ -5034,113 +5509,176 @@ const DashboardPage = memo(function DashboardPage({
           testid="stat-active-assignments"
         />
         <StatCard
-          icon={AlertTriangle}
-          label="Belum submit"
-          value={s.missing_submissions || 0}
-          hint={`${s.ungraded_submissions || 0} submission belum dinilai`}
-          testid="stat-missing-submissions"
+          icon={BarChart3}
+          label="Rata-rata nilai"
+          value={s.avg_grade || 0}
+          hint={`${gradedSubmissions} submission sudah dinilai`}
+          testid="stat-dashboard-average"
         />
       </div>
-      <div className="grid gap-6 xl:grid-cols-[1.5fr_1fr]">
-        <Card
-          className="rounded-md shadow-none"
-          data-testid="dashboard-progress-card"
-        >
-          <CardHeader>
-            <CardTitle data-testid="dashboard-progress-title">
-              Ringkasan progres mahasiswa
-            </CardTitle>
+
+      <section className="dashboard-attention-section" data-testid="dashboard-attention-section">
+        <div className="dashboard-section-heading">
+          <div>
+            <p>Prioritas operasional</p>
+            <h3>Yang perlu ditindaklanjuti</h3>
+          </div>
+          <span>Angka diperbarui dari data kelas yang Anda kelola.</span>
+        </div>
+        <div className="dashboard-attention-grid">
+          <button type="button" onClick={() => onNavigate("grading")}>
+            <span className="dashboard-attention-icon amber"><Clock /></span>
+            <div><small>Antrean nilai</small><strong>{s.ungraded_submissions || 0}</strong><p>Submission menunggu pemeriksaan</p></div>
+            <ArrowLeft className="dashboard-attention-arrow" />
+          </button>
+          <button type="button" onClick={() => onNavigate("assignments")}>
+            <span className="dashboard-attention-icon red"><AlertTriangle /></span>
+            <div><small>Belum dikumpulkan</small><strong>{s.missing_submissions || 0}</strong><p>Tugas mahasiswa masih kosong</p></div>
+            <ArrowLeft className="dashboard-attention-arrow" />
+          </button>
+          <button type="button" onClick={() => onNavigate("students")}>
+            <span className="dashboard-attention-icon blue"><Users /></span>
+            <div><small>Permintaan kelas</small><strong>{pendingEnrollments}</strong><p>Menunggu persetujuan dosen</p></div>
+            <ArrowLeft className="dashboard-attention-arrow" />
+          </button>
+          <button type="button" onClick={() => onNavigate("students")}>
+            <span className="dashboard-attention-icon violet"><ShieldCheck /></span>
+            <div><small>Perlu perhatian</small><strong>{attentionStudents}</strong><p>Mahasiswa dengan risiko belajar</p></div>
+            <ArrowLeft className="dashboard-attention-arrow" />
+          </button>
+        </div>
+      </section>
+
+      <div className="dashboard-analytics-grid">
+        <Card className="dashboard-panel-card" data-testid="dashboard-trend-card">
+          <CardHeader className="dashboard-panel-header">
+            <div>
+              <p>7 hari terakhir</p>
+              <CardTitle>Aktivitas submission</CardTitle>
+            </div>
+            <Badge className="border-blue-200 bg-blue-50 text-blue-700">
+              {totalSubmissions} total
+            </Badge>
           </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Nama</TableHead>
-                  <TableHead>Submit</TableHead>
-                  <TableHead>Belum</TableHead>
-                  <TableHead>Rata-rata</TableHead>
-                  <TableHead>Risiko</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.progress?.slice(0, 8).map((student) => (
-                  <TableRow
-                    key={student.id}
-                    data-testid={`dashboard-progress-row-${student.id}`}
-                  >
-                    <TableCell
-                      data-testid={`dashboard-progress-name-${student.id}`}
-                    >
-                      {student.name}
-                    </TableCell>
-                    <TableCell
-                      data-testid={`dashboard-progress-submitted-${student.id}`}
-                    >
-                      {student.progress?.submitted}
-                    </TableCell>
-                    <TableCell
-                      data-testid={`dashboard-progress-missing-${student.id}`}
-                    >
-                      {student.progress?.missing}
-                    </TableCell>
-                    <TableCell
-                      data-testid={`dashboard-progress-grade-${student.id}`}
-                    >
-                      {student.progress?.avg_grade}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        className={statusClass(student.progress?.risk_label)}
-                        data-testid={`dashboard-progress-risk-${student.id}`}
-                      >
-                        {student.progress?.risk_label}
-                      </Badge>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+          <CardContent className="dashboard-chart-content">
+            <ResponsiveContainer width="100%" height={280}>
+              <AreaChart data={dashboardTrend} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="dashboardSubmissionGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#2563eb" stopOpacity={0.25} />
+                    <stop offset="95%" stopColor="#2563eb" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#e2e8f0" strokeDasharray="4 4" vertical={false} />
+                <XAxis dataKey="tanggal" tick={{ fontSize: 11, fill: "#64748b" }} tickLine={false} axisLine={false} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#64748b" }} tickLine={false} axisLine={false} />
+                <Tooltip />
+                <Legend iconType="circle" iconSize={8} />
+                <Area type="monotone" dataKey="masuk" name="Submission masuk" stroke="#2563eb" strokeWidth={3} fill="url(#dashboardSubmissionGradient)" />
+                <Area type="monotone" dataKey="dinilai" name="Sudah dinilai" stroke="#10b981" strokeWidth={2} fill="transparent" />
+              </AreaChart>
+            </ResponsiveContainer>
           </CardContent>
         </Card>
+
         <Card
-          className="rounded-md shadow-none"
+          className="dashboard-panel-card"
           data-testid="dashboard-reminder-card"
         >
-          <CardHeader>
-            <CardTitle data-testid="dashboard-reminder-title">
-              Tugas mendekati deadline
-            </CardTitle>
+          <CardHeader className="dashboard-panel-header">
+            <div>
+              <p>Agenda terdekat</p>
+              <CardTitle data-testid="dashboard-reminder-title">Deadline tugas</CardTitle>
+            </div>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onNavigate("calendar")}>
+              Kalender
+            </Button>
           </CardHeader>
-          <CardContent className="space-y-3">
-            {data.assignments?.slice(0, 5).map((item) => (
-              <div
-                key={item.id}
-                className="border border-slate-200 p-3"
-                data-testid={`dashboard-deadline-item-${item.id}`}
-              >
-                <p
-                  className="font-semibold"
-                  data-testid={`dashboard-deadline-title-${item.id}`}
-                >
-                  {item.title}
-                </p>
-                <p
-                  className="text-sm text-slate-500"
-                  data-testid={`dashboard-deadline-date-${item.id}`}
-                >
-                  {fmtDate(item.deadline)}
-                </p>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  className="mt-3"
-                  data-testid={`dashboard-send-reminder-${item.id}-button`}
-                  onClick={() => sendReminder(item.id)}
-                >
-                  <Bell /> Simpan reminder
+          <CardContent className="dashboard-deadline-list">
+            {upcomingAssignments.length === 0 ? (
+              <div className="dashboard-empty-panel"><CalendarDays /><strong>Agenda aman</strong><p>Tidak ada deadline tugas mendatang.</p></div>
+            ) : upcomingAssignments.map((item) => (
+              <article key={item.id} data-testid={`dashboard-deadline-item-${item.id}`}>
+                <span><CalendarDays /></span>
+                <div>
+                  <strong data-testid={`dashboard-deadline-title-${item.id}`}>{item.title}</strong>
+                  <p>{[item.course_name, item.class_name].filter(Boolean).join(" · ")}</p>
+                  <div>
+                    <small data-testid={`dashboard-deadline-date-${item.id}`}>{fmtDate(item.deadline)}</small>
+                    <DeadlineCountdown deadline={item.deadline} compact />
+                  </div>
+                </div>
+                <Button size="icon" variant="outline" title="Simpan reminder" aria-label={`Simpan reminder ${item.title}`} data-testid={`dashboard-send-reminder-${item.id}-button`} onClick={() => sendReminder(item.id)}>
+                  <Bell />
                 </Button>
-              </div>
+              </article>
             ))}
+          </CardContent>
+        </Card>
+      </div>
+
+      <div className="dashboard-lower-grid">
+        <Card
+          className="dashboard-panel-card"
+          data-testid="dashboard-progress-card"
+        >
+          <CardHeader className="dashboard-panel-header">
+            <div>
+              <p>Pemantauan mahasiswa</p>
+              <CardTitle data-testid="dashboard-progress-title">Progres dan risiko belajar</CardTitle>
+            </div>
+            <Button type="button" variant="ghost" size="sm" onClick={() => onNavigate("students")}>Lihat mahasiswa</Button>
+          </CardHeader>
+          <CardContent className="dashboard-progress-content">
+            {progressRows.length === 0 ? (
+              <div className="dashboard-empty-panel"><Users /><strong>Belum ada mahasiswa</strong><p>Progres akan muncul setelah mahasiswa masuk ke kelas.</p></div>
+            ) : (
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader><TableRow><TableHead>Mahasiswa</TableHead><TableHead>Progres tugas</TableHead><TableHead>Rata-rata</TableHead><TableHead>Risiko</TableHead></TableRow></TableHeader>
+                  <TableBody>
+                    {progressRows.slice(0, 8).map((student) => {
+                      const submitted = student.progress?.submitted || 0;
+                      const missing = student.progress?.missing || 0;
+                      const completion = submitted + missing ? Math.round((submitted / (submitted + missing)) * 100) : 0;
+                      return (
+                        <TableRow key={student.id} data-testid={`dashboard-progress-row-${student.id}`}>
+                          <TableCell><strong data-testid={`dashboard-progress-name-${student.id}`}>{student.name}</strong><small>{student.nim || student.email || "Mahasiswa"}</small></TableCell>
+                          <TableCell><div className="dashboard-student-progress"><div><span style={{ width: `${completion}%` }} /></div><p><strong>{completion}%</strong> · {submitted} selesai · {missing} belum</p></div></TableCell>
+                          <TableCell data-testid={`dashboard-progress-grade-${student.id}`}><strong>{student.progress?.avg_grade || 0}</strong></TableCell>
+                          <TableCell><Badge className={statusClass(student.progress?.risk_label)} data-testid={`dashboard-progress-risk-${student.id}`}>{student.progress?.risk_label}</Badge></TableCell>
+                        </TableRow>
+                      );
+                    })}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Card className="dashboard-panel-card" data-testid="dashboard-latest-activity-card">
+          <CardHeader className="dashboard-panel-header"><div><p>Baru terjadi</p><CardTitle>Aktivitas terbaru</CardTitle></div></CardHeader>
+          <CardContent className="dashboard-activity-feed">
+            {recentSubmissions.length === 0 && latestComments.length === 0 ? (
+              <div className="dashboard-empty-panel"><Clock /><strong>Belum ada aktivitas</strong><p>Submission dan diskusi terbaru akan tampil di sini.</p></div>
+            ) : (
+              <>
+                {recentSubmissions.map((submission) => (
+                  <article key={submission.id}>
+                    <span className="submission"><Upload /></span>
+                    <div><strong>{submission.student_name || "Mahasiswa"}</strong><p>Mengumpulkan {submission.assignment_title || "tugas"}</p><small>{fmtDate(submission.submitted_at)}</small></div>
+                    <Badge className={statusClass(submission.status)}>{isGradedSubmission(submission) ? `Nilai ${submission.grade}` : submissionStatusLabel(submission.status)}</Badge>
+                  </article>
+                ))}
+                {latestComments.slice(0, 3).map((comment) => (
+                  <article key={comment.id}>
+                    <span className="comment"><MessageSquare /></span>
+                    <div><strong>{comment.author_name || "Pengguna"}</strong><p>{comment.content || "Mengirim lampiran diskusi"}</p><small>{fmtDate(comment.created_at)}</small></div>
+                  </article>
+                ))}
+              </>
+            )}
           </CardContent>
         </Card>
       </div>
@@ -5157,26 +5695,134 @@ function ClassesPage({
   saveClass,
   deleteCatalog,
   endClass,
+  finalizeClass,
+  archiveClass,
+  duplicateClass,
 }) {
   const programOptions = data.programs || [];
   const courseOptions = data.courses || [];
+  const classOptions = data.classes || [];
+  const activeClassCount = classOptions.filter((item) => item.status === "active").length;
+  const [activeStep, setActiveStep] = useState("program");
+
+  function jumpToStep(step) {
+    setActiveStep(step);
+    window.requestAnimationFrame(() => {
+      document
+        .getElementById(`academic-config-${step}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }
+
+  const steps = [
+    {
+      id: "program",
+      number: "1",
+      label: "Program studi",
+      count: programOptions.length,
+      description: "Identitas prodi",
+    },
+    {
+      id: "course",
+      number: "2",
+      label: "Mata kuliah",
+      count: courseOptions.length,
+      description: "Katalog pembelajaran",
+    },
+    {
+      id: "class",
+      number: "3",
+      label: "Kelas semester",
+      count: activeClassCount,
+      description: "Kelas aktif",
+    },
+  ];
+
   return (
-    <div
-      className="grid gap-6 xl:grid-cols-[0.85fr_1.15fr]"
-      data-testid="classes-page"
-    >
-      <div className="space-y-6">
+    <div className="academic-config-page" data-testid="classes-page">
+      <section className="academic-config-hero" data-testid="classes-hero">
+        <div>
+          <p className="meeting-overline">Konfigurasi akademik</p>
+          <h2>Susun struktur akademik secara berurutan</h2>
+          <p>
+            Mulai dari program studi, lanjutkan ke mata kuliah, lalu buat kelas
+            untuk semester berjalan. Data di setiap langkah akan menjadi pilihan
+            pada langkah berikutnya.
+          </p>
+        </div>
+        <div className="academic-config-summary" data-testid="classes-summary">
+          <div>
+            <strong>{programOptions.length}</strong>
+            <span>Prodi</span>
+          </div>
+          <div>
+            <strong>{courseOptions.length}</strong>
+            <span>Mata kuliah</span>
+          </div>
+          <div>
+            <strong>{activeClassCount}</strong>
+            <span>Kelas aktif</span>
+          </div>
+        </div>
+      </section>
+
+      <nav className="academic-config-step-nav" aria-label="Langkah konfigurasi akademik">
+        {steps.map((step) => (
+          <button
+            type="button"
+            key={step.id}
+            className={activeStep === step.id ? "active" : ""}
+            aria-current={activeStep === step.id ? "step" : undefined}
+            onClick={() => jumpToStep(step.id)}
+          >
+            <span>{step.number}</span>
+            <span>
+              <strong>{step.label}</strong>
+              <small>{step.count} · {step.description}</small>
+            </span>
+          </button>
+        ))}
+      </nav>
+
+      <div className="academic-config-note">
+        <BookOpen />
+        <p>
+          Urutan yang disarankan: <strong>Prodi → Mata kuliah → Kelas semester</strong>.
+          Anda tetap dapat mengedit data kapan saja tanpa mengulang langkah sebelumnya.
+        </p>
+      </div>
+
+      <section
+        id="academic-config-program"
+        className="academic-config-section"
+        data-testid="academic-program-section"
+      >
+        <header className="academic-section-heading">
+          <span className="academic-section-number">1</span>
+          <div>
+            <p>Langkah pertama</p>
+            <h2>Program studi</h2>
+            <span>Tambahkan identitas program studi yang menaungi mata kuliah.</span>
+          </div>
+        </header>
+        <div className="academic-step-layout">
         <form
-          className="space-y-4 border bg-white p-5"
+          className="academic-form-card space-y-4"
           data-testid="program-create-form"
           onSubmit={saveProgram}
         >
-          <h2
+          <div className="academic-form-heading">
+            <div className="academic-form-icon"><GraduationCap /></div>
+            <div>
+              <h2
             className="font-display text-2xl font-semibold"
             data-testid="program-create-title"
           >
             {forms.program.id ? "Edit program studi" : "Program studi"}
-          </h2>
+              </h2>
+              <p>{forms.program.id ? "Perbarui informasi prodi." : "Isi kode dan nama prodi baru."}</p>
+            </div>
+          </div>
           <Field id="program-code" label="Kode prodi">
             <Input
               id="program-code"
@@ -5237,225 +5883,16 @@ function ClassesPage({
             )}
           </div>
         </form>
-        <form
-          className="space-y-4 border bg-white p-5"
-          data-testid="course-create-form"
-          onSubmit={saveCourse}
-        >
-          <h2
-            className="font-display text-2xl font-semibold"
-            data-testid="course-create-title"
-          >
-            {forms.course.id ? "Edit mata kuliah" : "Mata kuliah"}
-          </h2>
-          <Field id="course-program" label="Prodi">
-            <select
-              id="course-program"
-              className="form-select"
-              data-testid="course-program-select"
-              value={forms.course.program_id}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  course: { ...forms.course, program_id: e.target.value },
-                })
-              }
-            >
-              {programOptions.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.name}
-                </option>
-              ))}
-            </select>
-          </Field>
-          <Field id="course-code" label="Kode">
-            <Input
-              id="course-code"
-              data-testid="course-code-input"
-              value={forms.course.code}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  course: { ...forms.course, code: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <Field id="course-name" label="Nama">
-            <Input
-              id="course-name"
-              data-testid="course-name-input"
-              value={forms.course.name}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  course: { ...forms.course, name: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <Field id="course-description" label="Deskripsi">
-            <Textarea
-              id="course-description"
-              data-testid="course-description-input"
-              value={forms.course.description}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  course: { ...forms.course, description: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <div className="flex flex-wrap gap-2">
-            <Button data-testid="course-create-submit-button">
-              <Plus />{" "}
-              {forms.course.id ? "Simpan mata kuliah" : "Tambah mata kuliah"}
-            </Button>
-            {forms.course.id && (
-              <Button
-                type="button"
-                variant="outline"
-                data-testid="course-cancel-edit-button"
-                onClick={() =>
-                  setForms({
-                    ...forms,
-                    course: {
-                      program_id: forms.course.program_id,
-                      code: "",
-                      name: "",
-                      credits: 3,
-                      description: "",
-                    },
-                  })
-                }
-              >
-                Batal
-              </Button>
-            )}
-          </div>
-        </form>
-        <form
-          className="space-y-4 border bg-white p-5"
-          data-testid="class-create-form"
-          onSubmit={saveClass}
-        >
-          <h2
-            className="font-display text-2xl font-semibold"
-            data-testid="class-create-title"
-          >
-            {forms.class.id ? "Edit kelas semester" : "Kelas semester"}
-          </h2>
-          <Field id="class-course" label="Mata kuliah">
-            <select
-              id="class-course"
-              className="form-select"
-              data-testid="class-course-select"
-              value={forms.class.course_id}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  class: { ...forms.class, course_id: e.target.value },
-                })
-              }
-            >
-              {courseOptions.map((c) => (
-                <option
-                  key={c.id}
-                  value={c.id}
-                >{`${c.program_name ? `${c.program_name} - ` : ""}${c.name}`}</option>
-              ))}
-            </select>
-          </Field>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field id="class-year" label="Tahun akademik">
-              <Input
-                id="class-year"
-                data-testid="class-year-input"
-                value={forms.class.academic_year}
-                onChange={(e) =>
-                  setForms({
-                    ...forms,
-                    class: { ...forms.class, academic_year: e.target.value },
-                  })
-                }
-              />
-            </Field>
-            <Field id="class-semester" label="Semester">
-              <Input
-                id="class-semester"
-                data-testid="class-semester-input"
-                value={forms.class.semester}
-                onChange={(e) =>
-                  setForms({
-                    ...forms,
-                    class: { ...forms.class, semester: e.target.value },
-                  })
-                }
-              />
-            </Field>
-          </div>
-          <Field id="class-name" label="Nama kelas">
-            <Input
-              id="class-name"
-              data-testid="class-name-input"
-              value={forms.class.name}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  class: { ...forms.class, name: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <Field id="class-schedule" label="Jadwal">
-            <Input
-              id="class-schedule"
-              data-testid="class-schedule-input"
-              value={forms.class.schedule}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  class: { ...forms.class, schedule: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <div className="flex flex-wrap gap-2">
-            <Button data-testid="class-create-submit-button">
-              <Plus /> {forms.class.id ? "Simpan kelas" : "Generate kelas"}
-            </Button>
-            {forms.class.id && (
-              <Button
-                type="button"
-                variant="outline"
-                data-testid="class-cancel-edit-button"
-                onClick={() =>
-                  setForms({
-                    ...forms,
-                    class: {
-                      academic_year: forms.class.academic_year,
-                      semester: forms.class.semester,
-                      course_id: forms.class.course_id,
-                      name: "",
-                      schedule: "",
-                    },
-                  })
-                }
-              >
-                Batal
-              </Button>
-            )}
-          </div>
-        </form>
-      </div>
-      <div className="space-y-6">
         <Card
-          className="rounded-md shadow-none"
+          className="academic-list-card rounded-md shadow-none"
           data-testid="program-list-card"
         >
-          <CardHeader>
-            <CardTitle data-testid="program-list-title">Daftar prodi</CardTitle>
+          <CardHeader className="academic-list-header">
+            <div>
+              <CardTitle data-testid="program-list-title">Daftar prodi</CardTitle>
+              <p>Prodi yang tersedia untuk dipilih pada katalog mata kuliah.</p>
+            </div>
+            <Badge className="border-blue-200 bg-blue-50 text-blue-700">{programOptions.length}</Badge>
           </CardHeader>
           <CardContent>
             <Table>
@@ -5467,6 +5904,9 @@ function ClassesPage({
                 </TableRow>
               </TableHeader>
               <TableBody>
+                {programOptions.length === 0 && (
+                  <TableRow><TableCell colSpan={3}><div className="academic-empty-row"><GraduationCap /><strong>Belum ada prodi</strong><span>Tambahkan prodi dari formulir di sebelah kiri.</span></div></TableCell></TableRow>
+                )}
                 {programOptions.map((item) => (
                   <TableRow
                     key={item.id}
@@ -5516,24 +5956,79 @@ function ClassesPage({
             </Table>
           </CardContent>
         </Card>
-        <Card className="rounded-md shadow-none" data-testid="course-list-card">
-          <CardHeader>
-            <CardTitle data-testid="course-list-title">
-              Daftar mata kuliah
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Kode</TableHead>
-                  <TableHead>Nama</TableHead>
-                  <TableHead>Prodi</TableHead>
-                  <TableHead>Aksi</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {courseOptions.map((item) => (
+        </div>
+      </section>
+
+      <section
+        id="academic-config-course"
+        className="academic-config-section"
+        data-testid="academic-course-section"
+      >
+        <header className="academic-section-heading">
+          <span className="academic-section-number">2</span>
+          <div>
+            <p>Langkah kedua</p>
+            <h2>Mata kuliah</h2>
+            <span>Hubungkan setiap mata kuliah ke program studi yang sesuai.</span>
+          </div>
+        </header>
+        <div className="academic-step-layout">
+          <form
+            className="academic-form-card space-y-4"
+            data-testid="course-create-form"
+            onSubmit={saveCourse}
+          >
+            <div className="academic-form-heading">
+              <div className="academic-form-icon"><BookOpen /></div>
+              <div>
+                <h2 className="font-display text-2xl font-semibold" data-testid="course-create-title">
+                  {forms.course.id ? "Edit mata kuliah" : "Mata kuliah"}
+                </h2>
+                <p>{forms.course.id ? "Perbarui informasi mata kuliah." : "Isi kode, nama, dan SKS mata kuliah."}</p>
+              </div>
+            </div>
+            {programOptions.length === 0 && <div className="academic-prerequisite"><AlertTriangle /><span>Buat minimal satu prodi terlebih dahulu.</span></div>}
+            <Field id="course-program" label="Prodi">
+              <select
+                id="course-program"
+                className="form-select"
+                data-testid="course-program-select"
+                value={forms.course.program_id}
+                onChange={(e) => setForms({ ...forms, course: { ...forms.course, program_id: e.target.value } })}
+              >
+                {programOptions.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+              </select>
+            </Field>
+            <div className="academic-inline-fields">
+              <Field id="course-code" label="Kode">
+                <Input id="course-code" data-testid="course-code-input" value={forms.course.code} onChange={(e) => setForms({ ...forms, course: { ...forms.course, code: e.target.value } })} />
+              </Field>
+              <Field id="course-credits" label="SKS">
+                <Input id="course-credits" type="number" min="1" max="8" data-testid="course-credits-input" value={forms.course.credits} onChange={(e) => setForms({ ...forms, course: { ...forms.course, credits: e.target.value } })} />
+              </Field>
+            </div>
+            <Field id="course-name" label="Nama">
+              <Input id="course-name" data-testid="course-name-input" value={forms.course.name} onChange={(e) => setForms({ ...forms, course: { ...forms.course, name: e.target.value } })} />
+            </Field>
+            <Field id="course-description" label="Deskripsi">
+              <Textarea id="course-description" data-testid="course-description-input" value={forms.course.description} onChange={(e) => setForms({ ...forms, course: { ...forms.course, description: e.target.value } })} />
+            </Field>
+            <div className="flex flex-wrap gap-2">
+              <Button data-testid="course-create-submit-button" disabled={!programOptions.length}><Plus /> {forms.course.id ? "Simpan mata kuliah" : "Tambah mata kuliah"}</Button>
+              {forms.course.id && <Button type="button" variant="outline" data-testid="course-cancel-edit-button" onClick={() => setForms({ ...forms, course: { program_id: forms.course.program_id, code: "", name: "", credits: 3, description: "" } })}>Batal</Button>}
+            </div>
+          </form>
+          <Card className="academic-list-card rounded-md shadow-none" data-testid="course-list-card">
+            <CardHeader className="academic-list-header">
+              <div><CardTitle data-testid="course-list-title">Daftar mata kuliah</CardTitle><p>Mata kuliah siap dipakai untuk membuat kelas semester.</p></div>
+              <Badge className="border-blue-200 bg-blue-50 text-blue-700">{courseOptions.length}</Badge>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader><TableRow><TableHead>Kode</TableHead><TableHead>Nama</TableHead><TableHead>Prodi</TableHead><TableHead>Aksi</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {courseOptions.length === 0 && <TableRow><TableCell colSpan={4}><div className="academic-empty-row"><BookOpen /><strong>Belum ada mata kuliah</strong><span>Tambahkan mata kuliah setelah membuat prodi.</span></div></TableCell></TableRow>}
+                  {courseOptions.map((item) => (
                   <TableRow key={item.id} data-testid={`course-row-${item.id}`}>
                     <TableCell data-testid={`course-code-${item.id}`}>
                       {item.code}
@@ -5579,35 +6074,79 @@ function ClassesPage({
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-        <Card className="rounded-md shadow-none" data-testid="class-list-card">
-          <CardHeader>
-            <CardTitle data-testid="class-list-title">
-              Daftar kelas & riwayat
-            </CardTitle>
-          </CardHeader>
-          <CardContent>
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Kelas</TableHead>
-                  <TableHead>Prodi</TableHead>
-                  <TableHead>Mata kuliah</TableHead>
-                  <TableHead>Kode</TableHead>
-                  <TableHead>Mahasiswa</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead>Aksi</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {data.classes.map((item) => (
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </div>
+      </section>
+
+      <section
+        id="academic-config-class"
+        className="academic-config-section"
+        data-testid="academic-class-section"
+      >
+        <header className="academic-section-heading">
+          <span className="academic-section-number">3</span>
+          <div>
+            <p>Langkah ketiga</p>
+            <h2>Kelas semester</h2>
+            <span>Buat ruang kelas, pilih periode, lalu kelola anggotanya dari menu Mahasiswa.</span>
+          </div>
+        </header>
+        <div className="academic-step-layout">
+          <form className="academic-form-card space-y-4" data-testid="class-create-form" onSubmit={saveClass}>
+            <div className="academic-form-heading">
+              <div className="academic-form-icon"><CalendarDays /></div>
+              <div>
+                <h2 className="font-display text-2xl font-semibold" data-testid="class-create-title">
+                  {forms.class.id ? "Edit kelas semester" : "Kelas semester"}
+                </h2>
+                <p>{forms.class.id ? "Perbarui detail kelas." : "Buat kelas untuk periode akademik aktif."}</p>
+              </div>
+            </div>
+            {courseOptions.length === 0 && <div className="academic-prerequisite"><AlertTriangle /><span>Buat minimal satu mata kuliah terlebih dahulu.</span></div>}
+            <Field id="class-course" label="Mata kuliah">
+              <select id="class-course" className="form-select" data-testid="class-course-select" value={forms.class.course_id} onChange={(e) => setForms({ ...forms, class: { ...forms.class, course_id: e.target.value } })}>
+                {courseOptions.map((c) => <option key={c.id} value={c.id}>{`${c.program_name ? `${c.program_name} - ` : ""}${c.name}`}</option>)}
+              </select>
+            </Field>
+            <div className="academic-inline-fields">
+              <Field id="class-year" label="Tahun akademik">
+                <Input id="class-year" data-testid="class-year-input" value={forms.class.academic_year} onChange={(e) => setForms({ ...forms, class: { ...forms.class, academic_year: e.target.value } })} />
+              </Field>
+              <Field id="class-semester" label="Semester">
+                <Input id="class-semester" data-testid="class-semester-input" value={forms.class.semester} onChange={(e) => setForms({ ...forms, class: { ...forms.class, semester: e.target.value } })} />
+              </Field>
+            </div>
+            <Field id="class-name" label="Nama kelas">
+              <Input id="class-name" placeholder="Contoh: IF-4A" data-testid="class-name-input" value={forms.class.name} onChange={(e) => setForms({ ...forms, class: { ...forms.class, name: e.target.value } })} />
+            </Field>
+            <Field id="class-schedule" label="Jadwal">
+              <Input id="class-schedule" placeholder="Contoh: Senin, 08.00–09.40" data-testid="class-schedule-input" value={forms.class.schedule} onChange={(e) => setForms({ ...forms, class: { ...forms.class, schedule: e.target.value } })} />
+            </Field>
+            <div className="academic-form-hint"><ShieldCheck /><span>Kode kelas akan dibuat otomatis dan dapat dibagikan kepada mahasiswa.</span></div>
+            <div className="flex flex-wrap gap-2">
+              <Button data-testid="class-create-submit-button" disabled={!courseOptions.length}><Plus /> {forms.class.id ? "Simpan kelas" : "Tambah kelas"}</Button>
+              {forms.class.id && <Button type="button" variant="outline" data-testid="class-cancel-edit-button" onClick={() => setForms({ ...forms, class: { academic_year: forms.class.academic_year, semester: forms.class.semester, course_id: forms.class.course_id, name: "", schedule: "" } })}>Batal</Button>}
+            </div>
+          </form>
+          <Card className="academic-list-card rounded-md shadow-none" data-testid="class-list-card">
+            <CardHeader className="academic-list-header">
+              <div><CardTitle data-testid="class-list-title">Daftar kelas & riwayat</CardTitle><p>Kelas aktif dan kelas yang sudah berakhir tetap tercatat di sini.</p></div>
+              <Badge className="border-blue-200 bg-blue-50 text-blue-700">{classOptions.length}</Badge>
+            </CardHeader>
+            <CardContent>
+              <Table>
+                <TableHeader><TableRow><TableHead>Kelas</TableHead><TableHead>Prodi</TableHead><TableHead>Mata kuliah</TableHead><TableHead>Kode</TableHead><TableHead>Mahasiswa</TableHead><TableHead>Status</TableHead><TableHead>Aksi</TableHead></TableRow></TableHeader>
+                <TableBody>
+                  {classOptions.length === 0 && <TableRow><TableCell colSpan={7}><div className="academic-empty-row"><CalendarDays /><strong>Belum ada kelas</strong><span>Buat kelas semester dari formulir di sebelah kiri.</span></div></TableCell></TableRow>}
+                  {classOptions.map((item) => (
                   <TableRow key={item.id} data-testid={`class-row-${item.id}`}>
                     <TableCell data-testid={`class-name-${item.id}`}>
-                      {item.name}
+                      <strong>{item.name}</strong>
+                      <small>{item.academic_year || "-"} · {item.semester || "-"}</small>
                     </TableCell>
                     <TableCell data-testid={`class-program-${item.id}`}>
                       {item.program_name || "-"}
@@ -5631,7 +6170,7 @@ function ClassesPage({
                         className={statusClass(item.status)}
                         data-testid={`class-status-${item.id}`}
                       >
-                        {item.status === "ended" ? "Berakhir" : item.status}
+                        {item.status_label || (item.status === "ended" ? "Berakhir" : item.status === "finalized" ? "Nilai difinalisasi" : item.status === "archived" ? "Arsip" : "Aktif")}
                       </Badge>
                     </TableCell>
                     <TableCell>
@@ -5639,6 +6178,7 @@ function ClassesPage({
                         <Button
                           size="sm"
                           variant="outline"
+                          disabled={item.status !== "active"}
                           data-testid={`class-edit-${item.id}-button`}
                           onClick={() =>
                             setForms({
@@ -5656,7 +6196,7 @@ function ClassesPage({
                         >
                           <Pencil /> Edit
                         </Button>
-                        {item.status !== "ended" && (
+                        {item.status === "active" && (
                           <Button
                             size="sm"
                             variant="outline"
@@ -5666,25 +6206,54 @@ function ClassesPage({
                             Akhiri
                           </Button>
                         )}
+                        {item.status === "ended" && (
+                          <Button
+                            size="sm"
+                            data-testid={`class-finalize-${item.id}-button`}
+                            onClick={() => finalizeClass(item)}
+                          >
+                            <CheckCircle2 /> Finalisasi nilai
+                          </Button>
+                        )}
+                        {item.status === "finalized" && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid={`class-archive-${item.id}-button`}
+                            onClick={() => archiveClass(item)}
+                          >
+                            <Database /> Arsipkan
+                          </Button>
+                        )}
+                        {item.status !== "active" && (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            data-testid={`class-duplicate-${item.id}-button`}
+                            onClick={() => duplicateClass(item)}
+                          >
+                            <RotateCcw /> Periode baru
+                          </Button>
+                        )}
                         <Button
                           size="sm"
                           variant="outline"
                           data-testid={`class-delete-${item.id}-button`}
-                          onClick={() =>
-                            deleteCatalog("classes", item.id, "Kelas")
-                          }
+                          disabled={item.status !== "active"}
+                          onClick={() => deleteCatalog("classes", item.id, "Kelas")}
                         >
                           <Trash2 /> Hapus
                         </Button>
                       </div>
                     </TableCell>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          </CardContent>
-        </Card>
-      </div>
+                  ))}
+                </TableBody>
+              </Table>
+            </CardContent>
+          </Card>
+        </div>
+      </section>
     </div>
   );
 }
@@ -5705,6 +6274,8 @@ function StudentsPage({
     isCampusAdmin ? "data" : "classes",
   );
   const pending = data.enrollments?.filter((r) => r.status === "pending") || [];
+  const classById = useMemo(() => new Map(data.classes.map((item) => [item.id, item])), [data.classes]);
+  const activeClasses = data.classes.filter((item) => item.status === "active");
   const selectedClass = data.classes.find(
     (c) => c.id === forms.student.class_id,
   );
@@ -5726,6 +6297,7 @@ function StudentsPage({
   const selectedIds = selectedStudentIds.filter((id) =>
     activeCandidateIds.has(id),
   );
+  const selectedClassAllowsLearning = selectedClass?.status === "active";
   const filteredCandidateIds = filteredCandidates.map((s) => s.id);
   const allFilteredSelected =
     filteredCandidateIds.length > 0 &&
@@ -5760,6 +6332,8 @@ function StudentsPage({
   async function runBulkStudentAction(endpoint, ids, success) {
     const cleanIds = Array.from(new Set(ids.filter(Boolean)));
     if (!cleanIds.length) return toast.error("Pilih minimal satu mahasiswa");
+    if (!selectedClassAllowsLearning) return toast.error("Keanggotaan hanya dapat diubah pada kelas Aktif");
+    if (!window.confirm(`Konfirmasi tindakan untuk ${cleanIds.length} mahasiswa pada kelas ${selectedClass?.name || "ini"}?`)) return;
     await postJson(
       `/classes/${forms.student.class_id}/students/${endpoint}`,
       { student_ids: cleanIds },
@@ -5836,6 +6410,7 @@ function StudentsPage({
             data-testid="student-create-form"
             onSubmit={(e) => {
               e.preventDefault();
+              if (!window.confirm("Buat akun mahasiswa dan langsung masukkan ke kelas aktif?")) return;
               postJson("/students", forms.student, "Mahasiswa ditambahkan");
             }}
           >
@@ -5915,7 +6490,7 @@ function StudentsPage({
                   })
                 }
               >
-                {data.classes.map((c) => (
+                {activeClasses.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
                   </option>
@@ -5987,7 +6562,7 @@ function StudentsPage({
                   })
                 }
               >
-                {data.classes.map((c) => (
+                {activeClasses.map((c) => (
                   <option key={c.id} value={c.id}>
                     {c.name}
                   </option>
@@ -6047,12 +6622,13 @@ function StudentsPage({
                       <Button
                         size="sm"
                         data-testid={`enrollment-approve-${r.id}-button`}
+                        disabled={classById.get(r.class_id)?.status !== "active"}
                         onClick={() =>
-                          postJson(
-                            `/enrollment-requests/${r.id}/approve`,
-                            {},
-                            "Mahasiswa disetujui",
-                          )
+                          window.confirm("Setujui mahasiswa masuk ke kelas ini?") && postJson(
+                              `/enrollment-requests/${r.id}/approve`,
+                              {},
+                              "Mahasiswa disetujui",
+                            )
                         }
                       >
                         ACC
@@ -6061,12 +6637,13 @@ function StudentsPage({
                         size="sm"
                         variant="outline"
                         data-testid={`enrollment-reject-${r.id}-button`}
+                        disabled={classById.get(r.class_id)?.status !== "active"}
                         onClick={() =>
-                          postJson(
-                            `/enrollment-requests/${r.id}/reject`,
-                            {},
-                            "Request ditolak",
-                          )
+                          window.confirm("Tolak request mahasiswa ini?") && postJson(
+                              `/enrollment-requests/${r.id}/reject`,
+                              {},
+                              "Request ditolak",
+                            )
                         }
                       >
                         Tolak
@@ -6103,7 +6680,7 @@ function StudentsPage({
                     <option
                       key={c.id}
                       value={c.id}
-                    >{`${c.name} - ${c.status === "ended" ? "Berakhir" : c.status}`}</option>
+                    >{`${c.name} - ${c.status_label || c.status}`}</option>
                   ))}
                 </select>
               </Field>
@@ -6125,6 +6702,12 @@ function StudentsPage({
                   <p data-testid="active-student-filter-count">
                     {filteredCandidates.length} cocok dengan filter
                   </p>
+                </div>
+              )}
+              {selectedClass && !selectedClassAllowsLearning && (
+                <div className="flex gap-2 border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900" data-testid="class-membership-read-only-notice">
+                  <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+                  <span>Kelas ini sudah {selectedClass.status_label || "berakhir"}. Keanggotaan tidak dapat diubah.</span>
                 </div>
               )}
               <div
@@ -6181,6 +6764,7 @@ function StudentsPage({
                           type="checkbox"
                           className="mt-1"
                           checked={selectedIds.includes(s.id)}
+                          disabled={!selectedClassAllowsLearning}
                           onChange={(e) =>
                             toggleCandidate(s.id, e.target.checked)
                           }
@@ -6218,7 +6802,7 @@ function StudentsPage({
                     type="button"
                     variant="outline"
                     data-testid="active-student-add-button"
-                    disabled={!selectedIds.length || !forms.student.class_id}
+                    disabled={!selectedIds.length || !forms.student.class_id || !selectedClassAllowsLearning}
                     onClick={() =>
                       runBulkStudentAction(
                         "bulk-add",
@@ -6232,7 +6816,7 @@ function StudentsPage({
                   <Button
                     type="button"
                     data-testid="active-student-invite-button"
-                    disabled={!selectedIds.length || !forms.student.class_id}
+                    disabled={!selectedIds.length || !forms.student.class_id || !selectedClassAllowsLearning}
                     onClick={() =>
                       runBulkStudentAction(
                         "bulk-invite",
@@ -6248,7 +6832,7 @@ function StudentsPage({
                     variant="outline"
                     data-testid="active-student-add-all-button"
                     disabled={
-                      !filteredCandidateIds.length || !forms.student.class_id
+                      !filteredCandidateIds.length || !forms.student.class_id || !selectedClassAllowsLearning
                     }
                     onClick={() =>
                       runBulkStudentAction(
@@ -6265,7 +6849,7 @@ function StudentsPage({
                     variant="outline"
                     data-testid="active-student-invite-all-button"
                     disabled={
-                      !filteredCandidateIds.length || !forms.student.class_id
+                      !filteredCandidateIds.length || !forms.student.class_id || !selectedClassAllowsLearning
                     }
                     onClick={() =>
                       runBulkStudentAction(
@@ -6315,16 +6899,16 @@ function StudentsPage({
                             variant="outline"
                             data-testid={`class-member-toggle-${s.id}-button`}
                             onClick={() =>
-                              postJson(
-                                `/students/${s.id}/status`,
-                                {
-                                  status:
-                                    s.status === "active"
-                                      ? "inactive"
-                                      : "active",
-                                },
-                                "Status mahasiswa diubah",
-                              )
+                              window.confirm("Ubah status mahasiswa ini?") && postJson(
+                                  `/students/${s.id}/status`,
+                                  {
+                                    status:
+                                      s.status === "active"
+                                        ? "inactive"
+                                        : "active",
+                                  },
+                                  "Status mahasiswa diubah",
+                                )
                             }
                           >
                             {s.status === "active"
@@ -6337,11 +6921,11 @@ function StudentsPage({
                           variant="outline"
                           data-testid={`class-member-remove-${s.id}-button`}
                           onClick={() =>
-                            postJson(
-                              `/classes/${forms.student.class_id}/students/${s.id}/remove`,
-                              {},
-                              "Mahasiswa dilepas dari kelas",
-                            )
+                            window.confirm("Lepaskan mahasiswa dari kelas ini?") && postJson(
+                                `/classes/${forms.student.class_id}/students/${s.id}/remove`,
+                                {},
+                                "Mahasiswa dilepas dari kelas",
+                              )
                           }
                         >
                           Lepas dari kelas
@@ -6355,7 +6939,7 @@ function StudentsPage({
                                 "Password baru mahasiswa",
                                 s.nim || "Mahasiswa123!",
                               );
-                              if (password)
+                              if (password && window.confirm(`Reset password ${s.name}?`))
                                 postJson(
                                   `/students/${s.id}/reset-password`,
                                   { password },
@@ -6463,6 +7047,7 @@ function StudentsPage({
 }
 
 function DiscussionThread({ material, token }) {
+  const discussionReadOnly = material.class_allows_learning === false;
   const [comments, setComments] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [attachments, setAttachments] = useState({});
@@ -6631,17 +7216,19 @@ function DiscussionThread({ material, token }) {
         </div>
         {comment.content && <p>{comment.content}</p>}
         {attachmentView(comment)}
-        <Button
-          type="button"
-          size="sm"
-          variant="ghost"
-          className="discussion-reply-button"
-          onClick={() => setReplyTo(replyTo === comment.id ? "" : comment.id)}
-          data-testid={`discussion-reply-${comment.id}-button`}
-        >
-          <Reply /> Balas
-        </Button>
-        {replyTo === comment.id && composer(comment.id, comment.id)}
+        {!discussionReadOnly && (
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="discussion-reply-button"
+            onClick={() => setReplyTo(replyTo === comment.id ? "" : comment.id)}
+            data-testid={`discussion-reply-${comment.id}-button`}
+          >
+            <Reply /> Balas
+          </Button>
+        )}
+        {!discussionReadOnly && replyTo === comment.id && composer(comment.id, comment.id)}
         {children.map((child) => renderComment(child, depth + 1))}
       </div>
     );
@@ -6663,7 +7250,11 @@ function DiscussionThread({ material, token }) {
       ) : (
         rootComments.map((comment) => renderComment(comment))
       )}
-      {composer("root")}
+      {discussionReadOnly ? (
+        <p className="rounded-md border border-slate-200 bg-slate-50 p-3 text-sm text-slate-600">
+          Diskusi ditutup karena kelas sudah berakhir. Seluruh riwayat komentar tetap dapat dibaca.
+        </p>
+      ) : composer("root")}
     </section>
   );
 }
@@ -6718,6 +7309,7 @@ function MaterialsPage({
             .join(" · "),
           classCode: classItem.class_code || "",
           status: classItem.status || "",
+          status_label: classItem.status_label || "",
           materials: groupMaterials,
           assignments: classAssignments,
           linkedAssignments,
@@ -6729,6 +7321,7 @@ function MaterialsPage({
   const selectedGroup = classGroups.find(
     (group) => group.id === selectedClassId,
   );
+  const selectedClassIsActive = selectedGroup?.status === "active";
   const totalLinkedAssignments = classGroups.reduce(
     (total, group) => total + group.linkedAssignments.length,
     0,
@@ -6924,9 +7517,9 @@ function MaterialsPage({
                           <p>Kode kelas: {group.classCode}</p>
                         )}
                       </div>
-                      {group.status === "ended" && (
+                      {group.status !== "active" && (
                         <Badge className="border-slate-200 bg-white text-slate-700">
-                          Berakhir
+                          {group.status_label || (group.status === "ended" ? "Berakhir" : group.status === "finalized" ? "Nilai difinalisasi" : "Arsip")}
                         </Badge>
                       )}
                     </div>
@@ -6996,6 +7589,11 @@ function MaterialsPage({
               ? ` · Kode ${selectedGroup.classCode}`
               : ""}
           </p>
+          {!selectedClassIsActive && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Kelas {selectedGroup.status_label || "sudah berakhir"}. Materi hanya dapat dilihat; perubahan baru tidak diperbolehkan.
+            </p>
+          )}
         </div>
         <div
           className="meeting-summary"
@@ -7020,9 +7618,16 @@ function MaterialsPage({
         data-testid="admin-material-detail-page"
       >
         <form
-          className="admin-material-form space-y-4 border bg-white p-5"
+          className={`admin-material-form space-y-4 border bg-white p-5 ${!selectedClassIsActive ? "pointer-events-none opacity-60" : ""}`}
           data-testid="material-create-form"
-          onSubmit={saveMaterial}
+          onSubmit={(event) => {
+            if (!selectedClassIsActive) {
+              event.preventDefault();
+              toast.error("Kelas sudah berakhir dan bersifat read-only");
+              return;
+            }
+            saveMaterial(event);
+          }}
         >
           <h2
             className="font-display text-2xl font-semibold"
@@ -7259,6 +7864,7 @@ function MaterialsPage({
                           type="button"
                           size="sm"
                           variant="outline"
+                          disabled={!selectedClassIsActive}
                           data-testid={`material-edit-${material.id}-button`}
                           onClick={() => editMaterial(material)}
                         >
@@ -7268,6 +7874,7 @@ function MaterialsPage({
                           type="button"
                           size="sm"
                           variant="outline"
+                          disabled={!selectedClassIsActive}
                           data-testid={`material-delete-${material.id}-button`}
                           onClick={() => deleteMaterial(material)}
                         >
@@ -7401,9 +8008,7 @@ function StudentMaterialsPage({
     meetingMaterialIds.has(assignment.material_id),
   );
   const assignmentsNeedingAction = meetingAssignments.filter(
-    (assignment) =>
-      !assignment.my_submission ||
-      assignment.my_submission?.review_status === "revision_requested",
+    (assignment) => assignmentNeedsStudentAction(assignment),
   ).length;
   const groups = useMemo(() => {
     const itemsByClass = new Map();
@@ -7422,6 +8027,8 @@ function StudentMaterialsPage({
         id: key,
         className: material.class_name || "Kelas",
         courseName: material.course_name || "Mata kuliah",
+        classStatus: material.class_status || "",
+        classStatusLabel: material.class_status_label || "",
         period: [material.academic_year, material.semester]
           .filter(Boolean)
           .join(" · "),
@@ -7437,11 +8044,11 @@ function StudentMaterialsPage({
       );
       return {
         ...group,
+        classStatus: group.classStatus || group.materials[0]?.class_status || "",
+        classStatusLabel: group.classStatusLabel || group.materials[0]?.class_status_label || "",
         assignments: linkedAssignments,
         assignmentsNeedingAction: linkedAssignments.filter(
-          (assignment) =>
-            !assignment.my_submission ||
-            assignment.my_submission?.review_status === "revision_requested",
+          (assignment) => assignmentNeedsStudentAction(assignment),
         ).length,
         latestMaterial: group.materials[group.materials.length - 1],
       };
@@ -7499,9 +8106,7 @@ function StudentMaterialsPage({
     );
     if (selectedExists) return;
     const actionable = relatedAssignments.find(
-      (assignment) =>
-        !assignment.my_submission ||
-        assignment.my_submission?.review_status === "revision_requested",
+      (assignment) => assignmentNeedsStudentAction(assignment),
     );
     setSelectedAssignmentId(actionable?.id || relatedAssignments[0]?.id || "");
   }, [
@@ -7600,6 +8205,11 @@ function StudentMaterialsPage({
                           {group.assignmentsNeedingAction} perlu dikerjakan
                         </Badge>
                       )}
+                      {group.classStatus && group.classStatus !== "active" && (
+                        <Badge className="border-slate-200 bg-slate-50 text-slate-700">
+                          {group.classStatusLabel || group.classStatus}
+                        </Badge>
+                      )}
                     </div>
                   </div>
                   <div className="course-material-stats">
@@ -7667,6 +8277,11 @@ function StudentMaterialsPage({
             {selectedGroup.className}
             {selectedGroup.period ? ` · ${selectedGroup.period}` : ""}
           </p>
+          {selectedGroup.classStatus && selectedGroup.classStatus !== "active" && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Kelas {selectedGroup.classStatusLabel || "sudah berakhir"}. Materi dan riwayat tugas tetap dapat dilihat; pengumpulan baru ditutup.
+            </p>
+          )}
         </div>
         <div className="meeting-summary" data-testid="student-meeting-summary">
           <div>
@@ -7713,10 +8328,7 @@ function StudentMaterialsPage({
                 (assignment) => assignment.material_id === material.id,
               );
               const needsAction = related.some(
-                (assignment) =>
-                  !assignment.my_submission ||
-                  assignment.my_submission?.review_status ===
-                    "revision_requested",
+                (assignment) => assignmentNeedsStudentAction(assignment),
               );
               return (
                 <div key={material.id} className="meeting-index-item">
@@ -7972,6 +8584,8 @@ function AssignmentsPage({
             .filter(Boolean)
             .join(" · "),
           classCode: classItem.class_code || "",
+          status: classItem.status || "",
+          status_label: classItem.status_label || "",
           assignments: groupAssignments,
           scheduled: groupAssignments.filter((item) =>
             isFutureDate(item.published_at),
@@ -7986,6 +8600,7 @@ function AssignmentsPage({
   const selectedGroup = classGroups.find(
     (group) => group.id === selectedClassId,
   );
+  const selectedClassIsActive = selectedGroup?.status === "active";
   const selectedMaterials = data.materials.filter(
     (material) => material.class_id === selectedGroup?.id,
   );
@@ -8028,6 +8643,7 @@ function AssignmentsPage({
         allowed_formats: "pdf,docx,zip,png,jpg",
         max_file_size_mb: DEFAULT_SUBMISSION_MAX_FILE_MB,
         assignment_type: "individu",
+        assessment_category: "tugas",
         allow_revision: true,
         material_id: "",
         is_practicum: false,
@@ -8066,6 +8682,7 @@ function AssignmentsPage({
             ? item.rubric
             : defaultAssignmentRubric(),
         assignment_type: item.assignment_type || "individu",
+        assessment_category: item.assessment_category || "tugas",
         allow_revision: item.allow_revision !== false,
         is_practicum: Boolean(item.is_practicum),
         practicum_goal: item.practicum_goal || "",
@@ -8170,6 +8787,11 @@ function AssignmentsPage({
                           <p>Kode kelas: {group.classCode}</p>
                         )}
                       </div>
+                      {group.status !== "active" && (
+                        <Badge className="border-slate-200 bg-white text-slate-700">
+                          {group.status_label || (group.status === "ended" ? "Berakhir" : group.status === "finalized" ? "Nilai difinalisasi" : "Arsip")}
+                        </Badge>
+                      )}
                       {group.scheduled > 0 && (
                         <Badge className="border-amber-200 bg-amber-50 text-amber-700">
                           {group.scheduled} terjadwal
@@ -8242,6 +8864,11 @@ function AssignmentsPage({
               ? ` · Kode ${selectedGroup.classCode}`
               : ""}
           </p>
+          {!selectedClassIsActive && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Kelas {selectedGroup.status_label || "sudah berakhir"}. Tugas hanya dapat dilihat; pembuatan dan perubahan tugas ditutup.
+            </p>
+          )}
         </div>
         <div
           className="meeting-summary"
@@ -8266,9 +8893,16 @@ function AssignmentsPage({
         data-testid="admin-assignment-detail-page"
       >
         <form
-          className="admin-material-form space-y-4 border bg-white p-5"
+          className={`admin-material-form space-y-4 border bg-white p-5 ${!selectedClassIsActive ? "pointer-events-none opacity-60" : ""}`}
           data-testid="assignment-create-form"
-          onSubmit={createAssignment}
+          onSubmit={(event) => {
+            if (!selectedClassIsActive) {
+              event.preventDefault();
+              toast.error("Kelas sudah berakhir dan bersifat read-only");
+              return;
+            }
+            createAssignment(event);
+          }}
         >
           <div>
             <h2
@@ -8318,6 +8952,21 @@ function AssignmentsPage({
                 updateAssignment({ description: e.target.value })
               }
             />
+          </Field>
+          <Field id="assignment-assessment-category" label="Komponen nilai">
+            <select
+              id="assignment-assessment-category"
+              className="form-select"
+              data-testid="assignment-assessment-category-select"
+              value={assignment.assessment_category || "tugas"}
+              onChange={(e) =>
+                updateAssignment({ assessment_category: e.target.value })
+              }
+            >
+              <option value="tugas">Tugas — masuk ke bobot Tugas</option>
+              <option value="uts">UTS — masuk ke bobot UTS</option>
+              <option value="uas">UAS — masuk ke bobot UAS</option>
+            </select>
           </Field>
           <Field id="assignment-attachment-link" label="Lampiran link">
             <Input
@@ -8579,6 +9228,12 @@ function AssignmentsPage({
                         data-testid={`assignment-class-name-${item.id}`}
                       >
                         {item.class_name}
+                      </Badge>
+                      <Badge
+                        className="ml-2 border-blue-200 bg-blue-50 text-blue-700"
+                        data-testid={`assignment-assessment-category-${item.id}`}
+                      >
+                        {(item.assessment_category || "tugas").toUpperCase()}
                       </Badge>
                       <Badge
                         className={
@@ -8847,14 +9502,20 @@ function GradingPage({
 }) {
   const progress = useActionProgress();
   const [gradeRows, setGradeRows] = useState({});
-  const [filter, setFilter] = useState({ assignment_id: "" });
+  const [filter, setFilter] = useState({
+    assignment_id: "",
+    status: "all",
+    query: "",
+  });
   const [selectedClassId, setSelectedClassId] = useState("");
   const [previewTarget, setPreviewTarget] = useState(null);
   const [previewDoc, setPreviewDoc] = useState(null);
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
+  const initializedClassRef = useRef("");
   const classOptions = useMemo(() => data.classes || [], [data.classes]);
   const selectedClass = classOptions.find((c) => c.id === selectedClassId);
+  const gradingReadOnly = Boolean(selectedClass && selectedClass.allows_grading === false);
 
   const classGroups = useMemo(() => {
     const map = new Map();
@@ -8865,6 +9526,8 @@ function GradingPage({
           classId: cid,
           courseName: a.course_name || "Mapel",
           className: a.class_name || "Kelas",
+          status: a.class_status || "",
+          statusLabel: a.class_status_label || "",
           assignments: 0,
           total: 0,
           ungraded: 0,
@@ -8884,6 +9547,8 @@ function GradingPage({
           classId: cid,
           courseName: assignment.course_name || "Mapel",
           className: assignment.class_name || "Kelas",
+          status: assignment.class_status || "",
+          statusLabel: assignment.class_status_label || "",
           assignments: 0,
           total: 0,
           ungraded: 0,
@@ -8904,13 +9569,20 @@ function GradingPage({
           classId: c.id,
           courseName: c.course_name || "Mapel",
           className: c.name || "Kelas",
+          status: c.status || "",
+          statusLabel: c.status_label || "",
           assignments: 0,
           total: 0,
           ungraded: 0,
           graded: 0,
         });
     });
-    return Array.from(map.values()).sort((a, b) =>
+    return Array.from(map.values()).map((group) => {
+      const classDoc = classOptions.find((item) => item.id === group.classId);
+      return classDoc
+        ? { ...group, status: classDoc.status || group.status, statusLabel: classDoc.status_label || group.statusLabel }
+        : group;
+    }).sort((a, b) =>
       a.courseName.localeCompare(b.courseName, "id"),
     );
   }, [data.assignments, data.submissions, classOptions]);
@@ -8920,10 +9592,7 @@ function GradingPage({
       (data.assignments || []).filter((a) => a.class_id === selectedClassId),
     [data.assignments, selectedClassId],
   );
-  const visibleAssignments = selectedAssignments.filter(
-    (a) => !filter.assignment_id || a.id === filter.assignment_id,
-  );
-  const ready = useMemo(() => {
+  const classSubmissions = useMemo(() => {
     return (data.submissions || []).filter((s) => {
       const assignment = data.assignments.find((a) => a.id === s.assignment_id);
       return (
@@ -8931,16 +9600,37 @@ function GradingPage({
           s.status,
         ) &&
         assignment &&
-        assignment.class_id === selectedClassId &&
-        (!filter.assignment_id || s.assignment_id === filter.assignment_id)
+        assignment.class_id === selectedClassId
       );
     });
-  }, [
-    data.submissions,
-    data.assignments,
-    selectedClassId,
-    filter.assignment_id,
-  ]);
+  }, [data.submissions, data.assignments, selectedClassId]);
+  const ready = useMemo(() => {
+    const query = filter.query.trim().toLowerCase();
+    return classSubmissions
+      .filter((s) => {
+        const matchesAssignment =
+          !filter.assignment_id || s.assignment_id === filter.assignment_id;
+        const matchesStatus =
+          filter.status === "all" ||
+          (filter.status === "ungraded" && s.grade == null) ||
+          (filter.status === "graded" && s.grade != null) ||
+          (filter.status === "revision" &&
+            s.review_status === "revision_requested");
+        const matchesQuery =
+          !query ||
+          `${s.student_name || ""} ${s.student_nim || ""} ${s.assignment_title || ""}`
+            .toLowerCase()
+            .includes(query);
+        return matchesAssignment && matchesStatus && matchesQuery;
+      })
+      .sort((a, b) => {
+        if ((a.grade == null) !== (b.grade == null)) return a.grade == null ? -1 : 1;
+        return new Date(b.submitted_at || 0) - new Date(a.submitted_at || 0);
+      });
+  }, [classSubmissions, filter]);
+  const visibleAssignments = selectedAssignments.filter(
+    (a) => !filter.assignment_id || a.id === filter.assignment_id,
+  );
   const grouped = visibleAssignments
     .map((a) => ({
       assignment: a,
@@ -8948,16 +9638,21 @@ function GradingPage({
     }))
     .filter((group) => group.rows.length > 0);
 
+  const selectedSubmission =
+    ready.find((s) => s.id === forms.grade.submission_id) || null;
+  const selectedAssignment = selectedAssignments.find(
+    (a) => a.id === selectedSubmission?.assignment_id,
+  );
   const updateRow = (id, patch) =>
-    setGradeRows({
-      ...gradeRows,
+    setGradeRows((current) => ({
+      ...current,
       [id]: {
-        score: gradeRows[id]?.score ?? "",
-        feedback: gradeRows[id]?.feedback ?? "",
-        revision_note: gradeRows[id]?.revision_note ?? "",
+        score: current[id]?.score ?? "",
+        feedback: current[id]?.feedback ?? "",
+        revision_note: current[id]?.revision_note ?? "",
         ...patch,
       },
-    });
+    }));
   const submitRows = () => {
     const grades = ready
       .filter(
@@ -9016,15 +9711,49 @@ function GradingPage({
       setSelectedClassId("");
   }, [classOptions, selectedClassId]);
 
+  useEffect(() => {
+    if (!selectedClassId) {
+      initializedClassRef.current = "";
+      return;
+    }
+    const current = ready.find((s) => s.id === forms.grade.submission_id);
+    if (initializedClassRef.current === selectedClassId && current) return;
+    const next = current || ready[0];
+    initializedClassRef.current = selectedClassId;
+    setForms((current) => ({
+      ...current,
+      grade: {
+        ...current.grade,
+        submission_id: next?.id || "",
+        score: next?.grade ?? "",
+        feedback: next?.feedback || "",
+        revision_note: next?.revision_note || "",
+      },
+    }));
+  }, [selectedClassId, ready, forms.grade.submission_id, setForms]);
+
+  function chooseSubmission(submission) {
+    setForms((current) => ({
+      ...current,
+      grade: {
+        ...current.grade,
+        submission_id: submission.id,
+        score: submission.grade ?? "",
+        feedback: submission.feedback || "",
+        revision_note: submission.revision_note || "",
+      },
+    }));
+  }
+
   function openClass(classId) {
     setSelectedClassId(classId);
-    setFilter({ assignment_id: "" });
+    setFilter({ assignment_id: "", status: "all", query: "" });
     setGradeRows({});
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
   function backToOverview() {
     setSelectedClassId("");
-    setFilter({ assignment_id: "" });
+    setFilter({ assignment_id: "", status: "all", query: "" });
     setGradeRows({});
     setPreviewTarget(null);
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -9040,10 +9769,11 @@ function GradingPage({
               className="font-display text-2xl font-semibold"
               data-testid="grading-overview-title"
             >
-              Penilaian per kelas
+              Mulai dari kelas yang perlu ditinjau
             </h2>
             <p className="meeting-description">
-              Pilih kelas untuk melihat submission mahasiswa dan mengisi nilai.
+              Submission yang belum dinilai ditampilkan sebagai prioritas agar
+              pekerjaan koreksi lebih mudah dilanjutkan.
             </p>
           </div>
           <div
@@ -9054,15 +9784,15 @@ function GradingPage({
               <strong>{classGroups.length}</strong>
               <span>Kelas</span>
             </div>
-            <div>
+            <div className="attention">
               <strong>{(data.assignments || []).length}</strong>
               <span>Tugas</span>
             </div>
             <div>
               <strong>
-                {(data.submissions || []).filter((s) => s.grade != null).length}
+                {classGroups.reduce((total, group) => total + group.ungraded, 0)}
               </strong>
-              <span>Dinilai</span>
+              <span>Perlu dinilai</span>
             </div>
           </div>
         </section>
@@ -9072,48 +9802,69 @@ function GradingPage({
             description="Buat kelas dan tugas terlebih dahulu."
           />
         ) : (
-          <div className="course-card-grid" data-testid="grading-class-grid">
-            {classGroups.map((g) => (
-              <Card
-                key={g.classId}
-                className="course-material-card rounded-md shadow-none cursor-pointer hover:shadow-md transition-shadow"
-                data-testid={`grading-class-card-${g.classId}`}
-                onClick={() => openClass(g.classId)}
-              >
-                <CardContent className="course-material-card-content">
-                  <div className="course-material-card-main">
-                    <span className="course-material-card-icon">
+          <div className="grading-class-grid" data-testid="grading-class-grid">
+            {classGroups.map((g) => {
+              const completion = g.total
+                ? Math.round((g.graded / g.total) * 100)
+                : 0;
+              return (
+                <button
+                  type="button"
+                  key={g.classId}
+                  className="grading-class-card"
+                  data-testid={`grading-class-card-${g.classId}`}
+                  onClick={() => openClass(g.classId)}
+                >
+                  <span className="grading-class-card-topline">
+                    <span className="grading-class-card-icon">
                       <CheckCircle2 />
                     </span>
-                    <div className="course-material-card-header">
-                      <div>
-                        <h3 data-testid={`grading-class-course-${g.classId}`}>
-                          {g.courseName}
-                        </h3>
-                        <p data-testid={`grading-class-name-${g.classId}`}>
-                          {g.className}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                  <div
-                    className="course-material-card-meta"
+                    <span className="grading-class-card-copy">
+                      <strong data-testid={`grading-class-course-${g.classId}`}>
+                        {g.courseName}
+                      </strong>
+                      <small data-testid={`grading-class-name-${g.classId}`}>
+                        {g.className}
+                      </small>
+                    </span>
+                    <Badge
+                      className={
+                        g.status !== "active"
+                          ? "border-slate-200 bg-slate-50 text-slate-700"
+                          : g.ungraded > 0
+                          ? "border-amber-200 bg-amber-50 text-amber-700"
+                          : g.total > 0
+                            ? "border-emerald-200 bg-emerald-50 text-emerald-700"
+                            : "border-slate-200 bg-slate-50 text-slate-700"
+                      }
+                    >
+                      {g.status !== "active"
+                        ? g.statusLabel || "Read-only"
+                        : g.ungraded > 0
+                        ? `${g.ungraded} antre`
+                        : g.total > 0
+                          ? "Selesai"
+                          : "Kosong"}
+                    </Badge>
+                  </span>
+                  <span
+                    className="grading-class-card-meta"
                     data-testid={`grading-class-meta-${g.classId}`}
                   >
                     <span>{g.assignments} tugas</span>
                     <span>{g.total} submission</span>
-                    {g.ungraded > 0 && (
-                      <span className="text-amber-600">
-                        {g.ungraded} belum dinilai
-                      </span>
-                    )}
-                    {g.ungraded === 0 && g.total > 0 && (
-                      <span className="text-emerald-600">Semua dinilai</span>
-                    )}
-                  </div>
-                </CardContent>
-              </Card>
-            ))}
+                    <span>{g.graded} dinilai</span>
+                  </span>
+                  <span className="grading-progress-track" aria-hidden="true">
+                    <span style={{ width: `${completion}%` }} />
+                  </span>
+                  <span className="grading-class-card-footer">
+                    <span>{g.total ? `${completion}% selesai` : "Belum ada submission"}</span>
+                    <strong>{g.total ? "Buka penilaian" : "Lihat kelas"}</strong>
+                  </span>
+                </button>
+              );
+            })}
           </div>
         )}
       </div>
@@ -9121,11 +9872,8 @@ function GradingPage({
   }
 
   return (
-    <div className="space-y-6" data-testid="grading-detail-page">
-      <div
-        className="flex flex-wrap items-center gap-3"
-        data-testid="grading-detail-header"
-      >
+    <div className="space-y-5" data-testid="grading-detail-page">
+      <section className="grading-detail-hero" data-testid="grading-detail-header">
         <Button
           variant="outline"
           size="sm"
@@ -9134,35 +9882,69 @@ function GradingPage({
         >
           <ArrowLeft /> Kembali
         </Button>
-        <div>
+        <div className="grading-detail-heading">
           <p
-            className="text-xs font-semibold uppercase tracking-[0.2em] text-slate-500"
+            className="meeting-overline"
             data-testid="grading-detail-overline"
           >
-            Penilaian
+            Ruang penilaian
           </p>
           <h2
-            className="font-display text-2xl font-bold text-slate-950"
             data-testid="grading-detail-title"
           >
-            {selectedClass.courseName} <span className="text-slate-400">·</span>{" "}
-            {selectedClass.className}
+            {selectedClass.course_name || "Mata kuliah"}
           </h2>
+          <p>
+            Kelas {selectedClass.name || "-"}
+            {selectedClass.semester ? ` · ${selectedClass.semester}` : ""}
+            {selectedClass.academic_year
+              ? ` · ${selectedClass.academic_year}`
+              : ""}
+          </p>
+          {gradingReadOnly && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Kelas {selectedClass.status_label || "sudah difinalisasi"}. Submission dan nilai tetap dapat dilihat, tetapi perubahan penilaian sudah dikunci.
+            </p>
+          )}
         </div>
-      </div>
+        <div className="grading-detail-summary" data-testid="grading-detail-stats">
+          <div>
+            <strong>{classSubmissions.length}</strong>
+            <span>Submission</span>
+          </div>
+          <div>
+            <strong>{classSubmissions.filter((s) => s.grade == null).length}</strong>
+            <span>Belum dinilai</span>
+          </div>
+          <div>
+            <strong>{classSubmissions.filter((s) => s.grade != null).length}</strong>
+            <span>Selesai</span>
+          </div>
+        </div>
+      </section>
       <Card
-        className="rounded-md shadow-none"
+        className="grading-filter-card rounded-md shadow-none"
         data-testid="grading-filter-card"
       >
-        <CardContent className="grid gap-3 p-4 md:grid-cols-2">
-          <Field id="grading-filter-assignment" label="Filter tugas">
+        <CardContent className="grading-filter-content">
+          <div className="grading-filter-heading">
+            <span>1</span>
+            <div>
+              <strong>Pilih tugas dan status</strong>
+              <p>Persempit antrean submission yang ingin dikerjakan.</p>
+            </div>
+          </div>
+          <Field id="grading-filter-assignment" label="Tugas">
             <select
               id="grading-filter-assignment"
               className="form-select"
               data-testid="grading-filter-assignment-select"
               value={filter.assignment_id}
               onChange={(e) =>
-                setFilter({ ...filter, assignment_id: e.target.value })
+                setFilter((current) => ({
+                  ...current,
+                  assignment_id: e.target.value,
+                }))
               }
             >
               <option value="">Semua tugas</option>
@@ -9173,177 +9955,356 @@ function GradingPage({
               ))}
             </select>
           </Field>
-          <div
-            className="flex items-end gap-3 text-sm text-slate-500"
-            data-testid="grading-detail-stats"
-          >
-            <span>{ready.length} submission</span>
-            <span>{ready.filter((s) => s.grade != null).length} dinilai</span>
-            <span>
-              {ready.filter((s) => s.grade == null).length} belum dinilai
-            </span>
+          <div className="grading-status-filter" aria-label="Filter status nilai">
+            {[
+              ["all", "Semua"],
+              ["ungraded", "Belum dinilai"],
+              ["graded", "Sudah dinilai"],
+              ["revision", "Revisi"],
+            ].map(([value, label]) => (
+              <button
+                type="button"
+                key={value}
+                className={filter.status === value ? "active" : ""}
+                aria-pressed={filter.status === value}
+                onClick={() =>
+                  setFilter((current) => ({ ...current, status: value }))
+                }
+              >
+                {label}
+              </button>
+            ))}
           </div>
+          <label className="grading-search" htmlFor="grading-search-input">
+            <Search />
+            <Input
+              id="grading-search-input"
+              data-testid="grading-search-input"
+              aria-label="Cari submission"
+              placeholder="Cari nama, NIM, atau tugas"
+              value={filter.query}
+              onChange={(e) =>
+                setFilter((current) => ({ ...current, query: e.target.value }))
+              }
+            />
+          </label>
         </CardContent>
       </Card>
-      <form
-        className="grid gap-6 xl:grid-cols-[0.7fr_1.3fr]"
-        data-testid="grading-form"
-        onSubmit={gradeSubmission}
-      >
-        <div className="space-y-4 border bg-white p-5">
-          <h2
-            className="font-display text-2xl font-semibold"
-            data-testid="grading-form-title"
-          >
-            Nilai satu submission
-          </h2>
-          <Field id="grading-submission" label="Submission">
+      <div className="grading-workspace">
+        <Card
+          className="grading-queue-card rounded-md shadow-none"
+          data-testid="submission-list-card"
+        >
+          <CardHeader className="grading-queue-header">
+            <div className="grading-section-title">
+              <span>2</span>
+              <div>
+                <CardTitle data-testid="submission-list-title">
+                  Pilih mahasiswa
+                </CardTitle>
+                <p>{ready.length} submission pada filter ini</p>
+              </div>
+            </div>
+          </CardHeader>
+          <CardContent className="grading-queue-content">
             <select
               id="grading-submission"
-              className="form-select"
+              className="form-select grading-submission-jump"
+              aria-label="Pilih submission mahasiswa"
               data-testid="grading-submission-select"
-              value={forms.grade.submission_id}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  grade: { ...forms.grade, submission_id: e.target.value },
-                })
-              }
+              value={selectedSubmission?.id || ""}
+              onChange={(event) => {
+                const submission = ready.find((s) => s.id === event.target.value);
+                if (submission) chooseSubmission(submission);
+              }}
             >
+              {!ready.length && <option value="">Tidak ada submission</option>}
               {ready.map((s) => (
-                <option
-                  key={s.id}
-                  value={s.id}
-                >{`${s.student_name} - ${s.assignment_title}`}</option>
+                <option key={s.id} value={s.id}>
+                  {s.student_name} — {s.assignment_title}
+                </option>
               ))}
             </select>
-          </Field>
-          <Field id="grading-score" label="Skor rubric">
-            <Input
-              id="grading-score"
-              type="number"
-              min="0"
-              max="100"
-              step="0.01"
-              data-testid="grading-score-input"
-              value={forms.grade.score}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  grade: {
-                    ...forms.grade,
-                    score: clampScoreInput(e.target.value),
-                  },
-                })
-              }
-            />
-          </Field>
-          <Field id="grading-feedback" label="Feedback">
-            <Textarea
-              id="grading-feedback"
-              data-testid="grading-feedback-input"
-              value={forms.grade.feedback}
-              onChange={(e) =>
-                setForms({
-                  ...forms,
-                  grade: { ...forms.grade, feedback: e.target.value },
-                })
-              }
-            />
-          </Field>
-          <Button data-testid="grading-submit-button">
-            <CheckCircle2 /> Simpan nilai
-          </Button>
-        </div>
-        <Card
-          className="rounded-md shadow-none"
-          data-testid="bulk-grading-card"
-        >
-          <CardHeader>
-            <CardTitle data-testid="bulk-grading-title">
-              Isi nilai per tugas
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            {grouped.length === 0 && (
-              <p
-                className="text-sm text-slate-500"
-                data-testid="bulk-grading-empty"
-              >
-                Belum ada submission pada filter ini.
-              </p>
-            )}
-            {grouped.map((group) => (
-              <div
-                key={group.assignment.id}
-                className="space-y-3 border border-blue-100 bg-blue-50/40 p-3"
-                data-testid={`bulk-grade-group-${group.assignment.id}`}
-              >
-                <div>
-                  <p
-                    className="font-display text-lg font-semibold text-blue-950"
-                    data-testid={`bulk-grade-group-title-${group.assignment.id}`}
-                  >
-                    {group.assignment.title}
-                  </p>
-                </div>
-                {group.rows.map((s) => (
-                  <div
-                    key={s.id}
-                    className="grid gap-2 border border-slate-200 bg-white p-3 md:grid-cols-[1fr_90px_1fr]"
-                    data-testid={`bulk-grade-row-${s.id}`}
-                  >
-                    <div>
-                      <p
-                        className="font-semibold"
-                        data-testid={`bulk-grade-student-${s.id}`}
-                      >
-                        {s.student_name}
-                      </p>
-                      <p
-                        className="text-sm text-slate-500"
-                        data-testid={`bulk-grade-assignment-${s.id}`}
-                      >
-                        {s.status}
-                      </p>
-                    </div>
-                    <Input
-                      type="number"
-                      min="0"
-                      max="100"
-                      step="0.01"
-                      placeholder="Nilai"
-                      data-testid={`bulk-grade-score-${s.id}-input`}
-                      value={gradeRows[s.id]?.score ?? s.grade ?? ""}
-                      onChange={(e) =>
-                        updateRow(s.id, {
-                          score: clampScoreInput(e.target.value),
-                        })
-                      }
-                    />
-                    <Input
-                      placeholder="Feedback"
-                      data-testid={`bulk-grade-feedback-${s.id}-input`}
-                      value={gradeRows[s.id]?.feedback ?? s.feedback ?? ""}
-                      onChange={(e) =>
-                        updateRow(s.id, { feedback: e.target.value })
-                      }
-                    />
-                  </div>
-                ))}
+            {ready.length === 0 ? (
+              <div className="grading-queue-empty">
+                <ClipboardList />
+                <strong>Tidak ada submission</strong>
+                <p>Ubah filter tugas, status, atau kata pencarian.</p>
               </div>
-            ))}
-            <Button
-              type="button"
-              variant="outline"
-              data-testid="bulk-grading-submit-button"
-              onClick={submitRows}
-            >
-              <Users /> Simpan nilai yang terisi
-            </Button>
+            ) : (
+              <div className="grading-queue-list">
+                {ready.map((submission) => {
+                  const isSelected = selectedSubmission?.id === submission.id;
+                  return (
+                    <button
+                      type="button"
+                      key={submission.id}
+                      className={`grading-queue-item ${isSelected ? "active" : ""}`}
+                      data-testid={`submission-row-${submission.id}`}
+                      aria-pressed={isSelected}
+                      onClick={() => chooseSubmission(submission)}
+                    >
+                      <span className="grading-queue-item-topline">
+                        <span>
+                          <strong data-testid={`submission-student-${submission.id}`}>
+                            {submission.student_name}
+                          </strong>
+                          <small>{submission.student_nim || "NIM belum tersedia"}</small>
+                        </span>
+                        <span
+                          className={`grading-queue-score ${submission.grade == null ? "pending" : ""}`}
+                          data-testid={`submission-grade-${submission.id}`}
+                        >
+                          {submission.grade ?? "—"}
+                        </span>
+                      </span>
+                      <span
+                        className="grading-queue-assignment"
+                        data-testid={`submission-assignment-${submission.id}`}
+                      >
+                        {submission.assignment_title}
+                      </span>
+                      <span className="grading-queue-item-meta">
+                        <Badge
+                          className={statusClass(submission.status)}
+                          data-testid={`submission-status-${submission.id}`}
+                        >
+                          {submissionStatusLabel(submission.status)}
+                        </Badge>
+                        <span data-testid={`submission-review-status-${submission.id}`}>
+                          {reviewStatusLabel(submission.review_status)}
+                        </span>
+                        <span>{fmtDate(submission.submitted_at)}</span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </CardContent>
         </Card>
-      </form>
+
+        <form
+          className={`grading-editor ${gradingReadOnly ? "grading-editor-readonly" : ""}`}
+          data-testid="grading-form"
+          onSubmit={(event) => {
+            if (gradingReadOnly) {
+              event.preventDefault();
+              toast.error("Nilai kelas ini sudah dikunci");
+              return;
+            }
+            gradeSubmission(event);
+          }}
+        >
+          <header className="grading-editor-header">
+            <div className="grading-section-title">
+              <span>3</span>
+              <div>
+                <p>Ruang kerja</p>
+                <h2 data-testid="grading-form-title">
+                  {selectedSubmission
+                    ? `Nilai ${selectedSubmission.student_name}`
+                    : "Pilih submission untuk dinilai"}
+                </h2>
+              </div>
+            </div>
+            {selectedSubmission && (
+              <Badge className={statusClass(selectedSubmission.status)}>
+                {reviewStatusLabel(selectedSubmission.review_status)}
+              </Badge>
+            )}
+          </header>
+
+          {!selectedSubmission ? (
+            <div className="grading-editor-empty">
+              <ClipboardList />
+              <strong>Belum ada mahasiswa yang dipilih</strong>
+              <p>Pilih submission dari antrean di sebelah kiri.</p>
+            </div>
+          ) : (
+            <>
+              <section className="grading-submission-summary">
+                <div>
+                  <span>Tugas</span>
+                  <strong>{selectedSubmission.assignment_title}</strong>
+                </div>
+                <div>
+                  <span>Waktu kirim</span>
+                  <strong>{fmtDate(selectedSubmission.submitted_at)}</strong>
+                  <small>{selectedSubmission.late_text || "Status waktu tidak tersedia"}</small>
+                </div>
+                <div>
+                  <span>Revisi</span>
+                  <strong>{selectedSubmission.revision_count || 0} kali</strong>
+                </div>
+              </section>
+
+              {selectedSubmission.note && (
+                <div className="grading-student-note">
+                  <MessageSquare />
+                  <div>
+                    <strong>Catatan mahasiswa</strong>
+                    <p>{selectedSubmission.note}</p>
+                  </div>
+                </div>
+              )}
+
+              <section className="grading-files" data-testid={`submission-file-${selectedSubmission.id}`}>
+                <div className="grading-block-heading">
+                  <div>
+                    <strong>Lampiran jawaban</strong>
+                    <p>Periksa file sebelum memberi nilai.</p>
+                  </div>
+                  <Badge className="border-slate-200 bg-slate-50 text-slate-700">
+                    {submissionFiles(selectedSubmission).length} file
+                  </Badge>
+                </div>
+                {submissionFiles(selectedSubmission).length ? (
+                  <div className="grading-file-list">
+                    {submissionFiles(selectedSubmission).map((file) => (
+                      <button
+                        type="button"
+                        key={fileId(file)}
+                        className="grading-file-button"
+                        data-testid={`submission-file-preview-${fileId(file)}-button`}
+                        onClick={() => setPreviewTarget({ submission: selectedSubmission, file })}
+                      >
+                        <span className="grading-file-icon"><FileText /></span>
+                        <span>
+                          <strong>{file.file_name || "File submission"}</strong>
+                          <small>{fileStatusLabel(file.upload_status)}</small>
+                        </span>
+                        <Eye />
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="grading-files-empty">Tidak ada file terlampir.</p>
+                )}
+              </section>
+
+              <section className="grading-score-block">
+                <div className="grading-block-heading">
+                  <div>
+                    <strong>Nilai akhir</strong>
+                    <p>Masukkan skor 0–100. Potongan keterlambatan diterapkan otomatis.</p>
+                  </div>
+                  {selectedSubmission.grade_predicate && (
+                    <Badge
+                      className="border-blue-200 bg-blue-50 text-blue-700"
+                      data-testid={`submission-predicate-${selectedSubmission.id}`}
+                    >
+                      Predikat {selectedSubmission.grade_predicate}
+                    </Badge>
+                  )}
+                </div>
+                <div className="grading-score-input-wrap">
+                  <Input
+                    id="grading-score"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.01"
+                    placeholder="0"
+                    aria-label="Nilai akhir"
+                    data-testid="grading-score-input"
+                    disabled={gradingReadOnly}
+                    value={forms.grade.score}
+                    onChange={(e) =>
+                      setForms((current) => ({
+                        ...current,
+                        grade: {
+                          ...current.grade,
+                          score: clampScoreInput(e.target.value),
+                        },
+                      }))
+                    }
+                  />
+                  <span>/ 100</span>
+                </div>
+                {!!selectedAssignment?.rubric?.length && (
+                  <div className="grading-rubric-summary">
+                    <BookOpen />
+                    <span>
+                      Rubrik: {selectedAssignment.rubric
+                        .map((item) => `${item.criterion} (${item.weight}%)`)
+                        .join(" · ")}
+                    </span>
+                  </div>
+                )}
+              </section>
+
+              <div className="grading-writing-grid">
+                <Field id="grading-feedback" label="Feedback untuk mahasiswa">
+                  <Textarea
+                    id="grading-feedback"
+                    rows={5}
+                    placeholder="Jelaskan bagian yang sudah baik dan yang perlu diperbaiki."
+                    data-testid="grading-feedback-input"
+                    disabled={gradingReadOnly}
+                    value={forms.grade.feedback}
+                    onChange={(e) =>
+                      setForms((current) => ({
+                        ...current,
+                        grade: { ...current.grade, feedback: e.target.value },
+                      }))
+                    }
+                  />
+                </Field>
+                <Field id="grading-revision-note" label="Catatan revisi (opsional)">
+                  <Textarea
+                    id="grading-revision-note"
+                    rows={5}
+                    placeholder="Isi jika tugas perlu dikembalikan untuk direvisi."
+                    data-testid="grading-revision-note-input"
+                    disabled={gradingReadOnly}
+                    value={forms.grade.revision_note}
+                    onChange={(e) =>
+                      setForms((current) => ({
+                        ...current,
+                        grade: { ...current.grade, revision_note: e.target.value },
+                      }))
+                    }
+                  />
+                </Field>
+              </div>
+
+              <footer className="grading-editor-actions">
+                <div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    data-testid={`submission-review-${selectedSubmission.id}-button`}
+                    disabled={gradingReadOnly}
+                    onClick={() => markReviewed(selectedSubmission.id)}
+                  >
+                    <Eye /> Tandai dilihat
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    data-testid={`submission-revision-${selectedSubmission.id}-button`}
+                    disabled={gradingReadOnly}
+                    onClick={() =>
+                      requestRevision(
+                        selectedSubmission.id,
+                        forms.grade.revision_note,
+                      )
+                    }
+                  >
+                    <Reply /> Minta revisi
+                  </Button>
+                </div>
+                <Button disabled={gradingReadOnly} data-testid="grading-submit-button">
+                  <CheckCircle2 /> Simpan nilai
+                </Button>
+              </footer>
+            </>
+          )}
+        </form>
+      </div>
       {previewTarget && (
         <FilePreviewPanel
           previewTarget={previewTarget}
@@ -9354,115 +10315,93 @@ function GradingPage({
           onClose={() => setPreviewTarget(null)}
         />
       )}
-      <Card
-        className="rounded-md shadow-none"
-        data-testid="submission-list-card"
-      >
-        <CardHeader>
-          <CardTitle data-testid="submission-list-title">
-            Submission mahasiswa
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Mahasiswa</TableHead>
-                <TableHead>Tugas</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Review</TableHead>
-                <TableHead>File</TableHead>
-                <TableHead>Nilai</TableHead>
-                <TableHead>Predikat</TableHead>
-                <TableHead>Aksi</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {ready.map((s) => {
-                const files = submissionFiles(s);
-                return (
-                  <TableRow key={s.id} data-testid={`submission-row-${s.id}`}>
-                    <TableCell data-testid={`submission-student-${s.id}`}>
-                      {s.student_name}
-                    </TableCell>
-                    <TableCell data-testid={`submission-assignment-${s.id}`}>
-                      {s.assignment_title}
-                    </TableCell>
-                    <TableCell>
-                      <Badge
-                        className={statusClass(s.status)}
-                        data-testid={`submission-status-${s.id}`}
-                      >
-                        {submissionStatusLabel(s.status)}
-                      </Badge>
-                    </TableCell>
-                    <TableCell data-testid={`submission-review-status-${s.id}`}>
-                      {s.review_status || "submitted"}
-                    </TableCell>
-                    <TableCell data-testid={`submission-file-${s.id}`}>
-                      {files.length ? (
-                        <div className="flex flex-wrap gap-2">
-                          {files.map((file) => (
-                            <div
-                              key={fileId(file)}
-                              className="flex flex-wrap items-center gap-2"
-                            >
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                data-testid={`submission-file-preview-${fileId(file)}-button`}
-                                onClick={() =>
-                                  setPreviewTarget({ submission: s, file })
-                                }
-                              >
-                                <Eye /> {file.file_name || "Preview"}
-                              </Button>
-                              <Badge
-                                className={statusClass(file.drive_sync_status)}
-                              >
-                                {driveSyncLabel(file.drive_sync_status)}
-                              </Badge>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        fileStatusLabel(s.file?.upload_status)
-                      )}
-                    </TableCell>
-                    <TableCell data-testid={`submission-grade-${s.id}`}>
-                      {s.grade ?? "-"}
-                    </TableCell>
-                    <TableCell data-testid={`submission-predicate-${s.id}`}>
-                      {s.grade_predicate || "-"}
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          data-testid={`submission-review-${s.id}-button`}
-                          onClick={() => markReviewed(s.id)}
-                        >
-                          Dilihat
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          data-testid={`submission-revision-${s.id}-button`}
-                          onClick={() => requestRevision(s.id)}
-                        >
-                          Revisi
-                        </Button>
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
-            </TableBody>
-          </Table>
-        </CardContent>
-      </Card>
+      <details className="grading-bulk-panel" data-testid="bulk-grading-card">
+        <summary>
+          <span className="grading-bulk-icon"><Users /></span>
+          <span>
+            <strong data-testid="bulk-grading-title">Nilai beberapa mahasiswa sekaligus</strong>
+            <small>Mode cepat untuk memasukkan nilai per tugas.</small>
+          </span>
+          <Badge className="border-slate-200 bg-slate-50 text-slate-700">
+            {ready.length} submission
+          </Badge>
+        </summary>
+        <div className="grading-bulk-content">
+          {grouped.length === 0 && (
+            <p className="grading-bulk-empty" data-testid="bulk-grading-empty">
+              Belum ada submission pada filter ini.
+            </p>
+          )}
+          {grouped.map((group) => (
+            <section
+              key={group.assignment.id}
+              className="grading-bulk-group"
+              data-testid={`bulk-grade-group-${group.assignment.id}`}
+            >
+              <header>
+                <strong data-testid={`bulk-grade-group-title-${group.assignment.id}`}>
+                  {group.assignment.title}
+                </strong>
+                <span>{group.rows.length} mahasiswa</span>
+              </header>
+              {group.rows.map((submission) => (
+                <div
+                  key={submission.id}
+                  className="grading-bulk-row"
+                  data-testid={`bulk-grade-row-${submission.id}`}
+                >
+                  <div>
+                    <strong data-testid={`bulk-grade-student-${submission.id}`}>
+                      {submission.student_name}
+                    </strong>
+                    <small data-testid={`bulk-grade-assignment-${submission.id}`}>
+                      {submission.student_nim || reviewStatusLabel(submission.review_status)}
+                    </small>
+                  </div>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="0.01"
+                    placeholder="Nilai"
+                    aria-label={`Nilai ${submission.student_name}`}
+                    data-testid={`bulk-grade-score-${submission.id}-input`}
+                    disabled={gradingReadOnly}
+                    value={gradeRows[submission.id]?.score ?? submission.grade ?? ""}
+                    onChange={(e) =>
+                      updateRow(submission.id, {
+                        score: clampScoreInput(e.target.value),
+                      })
+                    }
+                  />
+                  <Input
+                    placeholder="Feedback singkat"
+                    aria-label={`Feedback ${submission.student_name}`}
+                    data-testid={`bulk-grade-feedback-${submission.id}-input`}
+                    disabled={gradingReadOnly}
+                    value={gradeRows[submission.id]?.feedback ?? submission.feedback ?? ""}
+                    onChange={(e) =>
+                      updateRow(submission.id, { feedback: e.target.value })
+                    }
+                  />
+                </div>
+              ))}
+            </section>
+          ))}
+          <div className="grading-bulk-actions">
+            <p>Hanya baris yang nilainya Anda ubah yang akan disimpan.</p>
+            <Button
+              type="button"
+              variant="outline"
+              data-testid="bulk-grading-submit-button"
+              disabled={gradingReadOnly}
+              onClick={submitRows}
+            >
+              <CheckCircle2 /> Simpan nilai yang terisi
+            </Button>
+          </div>
+        </div>
+      </details>
     </div>
   );
 }
@@ -9476,7 +10415,7 @@ const GRADE_CHART_COLORS = {
 };
 const DIST_COLORS = ["#10b981", "#3b82f6", "#f59e0b", "#f97316", "#ef4444"];
 
-const GradeRecapPage = memo(function GradeRecapPage({ data }) {
+const GradeRecapPage = memo(function GradeRecapPage({ data, exportGradeRecap }) {
   const [selectedClass, setSelectedClass] = useState(null);
   const recapData = data.gradeRecap || [];
 
@@ -9541,6 +10480,11 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                           {g.class_name}
                         </p>
                       </div>
+                      {g.class_status && g.class_status !== "active" && (
+                        <Badge className="border-slate-200 bg-white text-slate-700">
+                          {g.class_status_label || (g.class_status === "ended" ? "Berakhir" : g.class_status === "finalized" ? "Nilai difinalisasi" : "Arsip")}
+                        </Badge>
+                      )}
                     </div>
                   </div>
                   <div
@@ -9570,10 +10514,17 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
     grade_distribution: dist,
     class_average: classAvg,
   } = selectedClass;
-  const allAssignmentIds = [
-    ...new Set(students.flatMap((s) => s.scores.map((sc) => sc.assignment_id))),
-  ];
+  const gradeWeights = { ...DEFAULT_GRADE_WEIGHTS, ...(selectedClass.grade_weights || {}) };
+  const recapAssignments = selectedClass.assignments || [];
+  const allAssignmentIds = recapAssignments.length
+    ? recapAssignments.map((assignment) => assignment.id)
+    : [
+        ...new Set(students.flatMap((s) => s.scores.map((sc) => sc.assignment_id))),
+      ];
   const assignmentTitles = {};
+  recapAssignments.forEach((assignment) => {
+    assignmentTitles[assignment.id] = assignment.title;
+  });
   students.forEach((s) =>
     s.scores.forEach((sc) => {
       assignmentTitles[sc.assignment_id] = sc.assignment_title;
@@ -9623,6 +10574,22 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
             {selectedClass.course_name}{" "}
             <span className="text-slate-400">·</span> {selectedClass.class_name}
           </h2>
+          {selectedClass.class_status && selectedClass.class_status !== "active" && (
+            <p className="mt-1 text-sm text-slate-600">
+              Status: {selectedClass.class_status_label || selectedClass.class_status}. Rekap menampilkan snapshot bobot dan nilai pada saat finalisasi bila tersedia.
+            </p>
+          )}
+        </div>
+        <div className="ml-auto flex flex-wrap gap-2" data-testid="grade-recap-export-actions">
+          <Button type="button" variant="outline" size="sm" data-testid="grade-recap-export-excel-button" onClick={() => exportGradeRecap("xlsx", selectedClass.class_id)}>
+            <FileSpreadsheet /> Excel
+          </Button>
+          <Button type="button" variant="outline" size="sm" data-testid="grade-recap-export-pdf-button" onClick={() => exportGradeRecap("pdf", selectedClass.class_id)}>
+            <FileText /> PDF
+          </Button>
+          <Button type="button" size="sm" data-testid="grade-recap-print-button" onClick={() => window.print()}>
+            <Printer /> Cetak
+          </Button>
         </div>
       </div>
 
@@ -9659,6 +10626,25 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
           testid="recap-stat-max"
         />
       </div>
+
+      <Card className="rounded-md shadow-none" data-testid="grade-recap-weights-card">
+        <CardHeader>
+          <CardTitle>Komposisi nilai mata kuliah</CardTitle>
+          <p className="text-sm text-slate-500">
+            Nilai sementara dinormalisasi dari komponen yang sudah dinilai. Setelah Tugas, UTS, dan UAS lengkap, sistem menerapkan bobot penuh.
+          </p>
+        </CardHeader>
+        <CardContent className="flex flex-wrap items-center gap-3">
+          {GRADE_WEIGHT_COMPONENTS.map((component) => (
+            <Badge key={component.key} className="border-blue-200 bg-blue-50 px-3 py-2 text-blue-800" data-testid={`grade-recap-weight-${component.key}`}>
+              {component.label} {gradeWeights[component.key]}%
+            </Badge>
+          ))}
+          <Badge className={selectedClass.grade_weights_customized ? "border-emerald-200 bg-emerald-50 text-emerald-700" : "border-slate-200 bg-slate-50 text-slate-600"} data-testid="grade-recap-weight-source">
+            {selectedClass.grade_weights_customized ? "Bobot custom" : "Bobot default"}
+          </Badge>
+        </CardContent>
+      </Card>
 
       <div
         className="grid gap-6 xl:grid-cols-2"
@@ -9760,6 +10746,9 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                 <TableRow>
                   <TableHead className="whitespace-nowrap">NIM</TableHead>
                   <TableHead className="whitespace-nowrap">Nama</TableHead>
+                  <TableHead className="whitespace-nowrap text-center">Tugas</TableHead>
+                  <TableHead className="whitespace-nowrap text-center">UTS</TableHead>
+                  <TableHead className="whitespace-nowrap text-center">UAS</TableHead>
                   {allAssignments.map((a) => (
                     <TableHead
                       key={a.id}
@@ -9769,7 +10758,7 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                     </TableHead>
                   ))}
                   <TableHead className="whitespace-nowrap text-center">
-                    Rata-rata
+                    Nilai akhir berbobot
                   </TableHead>
                 </TableRow>
               </TableHeader>
@@ -9779,6 +10768,7 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                   s.scores.forEach((sc) => {
                     scoreMap[sc.assignment_id] = sc;
                   });
+                  const componentScores = s.component_scores || {};
                   return (
                     <TableRow
                       key={s.student_id}
@@ -9790,6 +10780,11 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                       <TableCell className="font-medium whitespace-nowrap">
                         {s.student_name}
                       </TableCell>
+                      {GRADE_WEIGHT_COMPONENTS.map((component) => (
+                        <TableCell key={component.key} className="text-center whitespace-nowrap">
+                          {componentScores[component.key] == null ? <span className="text-slate-300">-</span> : componentScores[component.key]}
+                        </TableCell>
+                      ))}
                       {allAssignments.map((a) => {
                         const sc = scoreMap[a.id];
                         return (
@@ -9814,7 +10809,7 @@ const GradeRecapPage = memo(function GradeRecapPage({ data }) {
                         );
                       })}
                       <TableCell className="text-center font-bold whitespace-nowrap">
-                        {s.average}
+                        {s.weighted_grade ?? s.average}
                       </TableCell>
                     </TableRow>
                   );
@@ -9879,61 +10874,416 @@ const CalendarPage = memo(function CalendarPage({ events }) {
   );
 });
 
-const ReportsPage = memo(function ReportsPage({ data, exportGrades }) {
+const REPORT_STATUS_COLORS = {
+  Dinilai: "#10b981",
+  "Menunggu nilai": "#f59e0b",
+  "Perlu revisi": "#8b5cf6",
+};
+
+function reportDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+function reportShortDate(value) {
+  return new Intl.DateTimeFormat("id-ID", {
+    day: "2-digit",
+    month: "short",
+  }).format(value);
+}
+
+function isGradedSubmission(submission) {
   return (
-    <div className="space-y-6" data-testid="reports-page">
-      <div className="grid gap-4 md:grid-cols-4">
+    typeof submission?.grade === "number" ||
+    submission?.review_status === "graded" ||
+    submission?.status === "Dinilai"
+  );
+}
+
+function isRevisionSubmission(submission) {
+  return (
+    submission?.review_status === "revision_requested" ||
+    submission?.status === "Direvisi"
+  );
+}
+
+const ReportsPage = memo(function ReportsPage({
+  data,
+  exportGrades,
+  exportGradeRecap,
+}) {
+  const [selectedClassId, setSelectedClassId] = useState("");
+  const [trendDays, setTrendDays] = useState("14");
+  const submissions = useMemo(
+    () =>
+      (data.submissions || []).filter(
+        (submission) =>
+          !selectedClassId || submission.class_id === selectedClassId,
+      ),
+    [data.submissions, selectedClassId],
+  );
+  const classOptions = useMemo(
+    () =>
+      [...(data.classes || [])].sort((left, right) =>
+        `${left.course_name || ""} ${left.name || ""}`.localeCompare(
+          `${right.course_name || ""} ${right.name || ""}`,
+          "id",
+        ),
+      ),
+    [data.classes],
+  );
+  const selectedClass = classOptions.find(
+    (classItem) => classItem.id === selectedClassId,
+  );
+  const gradedCount = submissions.filter(isGradedSubmission).length;
+  const revisionCount = submissions.filter(isRevisionSubmission).length;
+  const waitingCount = submissions.filter(
+    (submission) =>
+      !isGradedSubmission(submission) && !isRevisionSubmission(submission),
+  ).length;
+  const lateCount = submissions.filter(
+    (submission) =>
+      Number(submission.late_hours || 0) > 0 ||
+      submission.status === "Terlambat",
+  ).length;
+  const gradingRate = submissions.length
+    ? Math.round((gradedCount / submissions.length) * 100)
+    : 0;
+  const lateRate = submissions.length
+    ? Math.round((lateCount / submissions.length) * 100)
+    : 0;
+
+  const statusData = [
+    { name: "Dinilai", value: gradedCount },
+    { name: "Menunggu nilai", value: waitingCount },
+    { name: "Perlu revisi", value: revisionCount },
+  ].filter((item) => item.value > 0);
+
+  const trendData = useMemo(() => {
+    const days = Number(trendDays);
+    const totals = new Map();
+    submissions.forEach((submission) => {
+      const key = reportDateKey(submission.submitted_at);
+      if (!key) return;
+      const current = totals.get(key) || { masuk: 0, dinilai: 0, terlambat: 0 };
+      current.masuk += 1;
+      if (isGradedSubmission(submission)) current.dinilai += 1;
+      if (
+        Number(submission.late_hours || 0) > 0 ||
+        submission.status === "Terlambat"
+      )
+        current.terlambat += 1;
+      totals.set(key, current);
+    });
+    const today = new Date();
+    today.setHours(12, 0, 0, 0);
+    return Array.from({ length: days }, (_, index) => {
+      const date = new Date(today);
+      date.setDate(today.getDate() - (days - index - 1));
+      return {
+        tanggal: reportShortDate(date),
+        ...(totals.get(reportDateKey(date)) || {
+          masuk: 0,
+          dinilai: 0,
+          terlambat: 0,
+        }),
+      };
+    });
+  }, [submissions, trendDays]);
+
+  const classPerformance = useMemo(
+    () =>
+      (data.gradeRecap || [])
+        .filter(
+          (classItem) =>
+            !selectedClassId || classItem.class_id === selectedClassId,
+        )
+        .map((classItem) => {
+          const classSubmissions = (data.submissions || []).filter(
+            (submission) => submission.class_id === classItem.class_id,
+          );
+          const classGraded = classSubmissions.filter(isGradedSubmission).length;
+          return {
+            id: classItem.class_id,
+            name: `${classItem.course_name || "Mata kuliah"} · ${classItem.class_name || "Kelas"}`,
+            rataRata: Number(classItem.class_average || 0),
+            ketuntasan: classSubmissions.length
+              ? Math.round((classGraded / classSubmissions.length) * 100)
+              : 0,
+            mahasiswa: Number(classItem.student_count || 0),
+          };
+        })
+        .sort((left, right) => right.rataRata - left.rataRata),
+    [data.gradeRecap, data.submissions, selectedClassId],
+  );
+  const bestClass = classPerformance.find((classItem) => classItem.rataRata > 0);
+  const totalStudents = selectedClassId
+    ? classPerformance.reduce(
+        (total, classItem) => total + classItem.mahasiswa,
+        0,
+      )
+    : data.report?.total_students || 0;
+  const totalAssignments = selectedClassId
+    ? (data.assignments || []).filter(
+        (assignment) => assignment.class_id === selectedClassId,
+      ).length
+    : data.report?.total_assignments || 0;
+  const exportClassId = selectedClassId || "";
+  const exportRecap = (format) => {
+    if (exportGradeRecap) return exportGradeRecap(format, exportClassId);
+    if (format === "xlsx") return exportGrades?.();
+    return undefined;
+  };
+
+  return (
+    <div className="reports-analytics-page" data-testid="reports-page">
+      <section className="reports-hero" data-testid="reports-hero">
+        <div>
+          <p className="reports-overline">Analitik Akademik</p>
+          <h2 data-testid="reports-title">Laporan yang siap dianalisis</h2>
+          <p>
+            Pantau arus submission, progres penilaian, keterlambatan, dan
+            performa kelas dalam satu tampilan.
+          </p>
+        </div>
+        <div className="reports-export-actions" data-testid="reports-export-actions">
+          <Button
+            type="button"
+            variant="outline"
+            data-testid="report-export-excel-button"
+            onClick={() => exportRecap("xlsx")}
+          >
+            <FileSpreadsheet /> Excel
+          </Button>
+          <Button
+            type="button"
+            variant="outline"
+            data-testid="report-export-pdf-button"
+            onClick={() => exportRecap("pdf")}
+          >
+            <FileText /> PDF
+          </Button>
+          <Button
+            type="button"
+            data-testid="report-print-button"
+            onClick={() => window.print()}
+          >
+            <Printer /> Cetak
+          </Button>
+        </div>
+      </section>
+
+      <section className="reports-filter-bar" aria-label="Filter laporan">
+        <div>
+          <label htmlFor="report-class-filter">Kelas</label>
+          <select
+            id="report-class-filter"
+            className="form-select"
+            data-testid="report-class-filter"
+            value={selectedClassId}
+            onChange={(event) => setSelectedClassId(event.target.value)}
+          >
+            <option value="">Semua kelas</option>
+            {classOptions.map((classItem) => (
+              <option key={classItem.id} value={classItem.id}>
+                {classItem.course_name || "Mata kuliah"} · {classItem.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div>
+          <label htmlFor="report-period-filter">Rentang tren</label>
+          <select
+            id="report-period-filter"
+            className="form-select"
+            data-testid="report-period-filter"
+            value={trendDays}
+            onChange={(event) => setTrendDays(event.target.value)}
+          >
+            <option value="7">7 hari terakhir</option>
+            <option value="14">14 hari terakhir</option>
+            <option value="30">30 hari terakhir</option>
+          </select>
+        </div>
+        <p data-testid="report-filter-description">
+          {selectedClass
+            ? `Menampilkan ${selectedClass.course_name || "mata kuliah"} · ${selectedClass.name}. Export mengikuti filter kelas ini.`
+            : "Menampilkan ringkasan seluruh kelas yang dapat Anda akses."}
+        </p>
+      </section>
+
+      <div className="reports-stat-grid" data-testid="report-summary-stats">
         <StatCard
           icon={Users}
           label="Mahasiswa"
-          value={data.report?.total_students || 0}
-          hint="Total terdaftar"
+          value={totalStudents}
+          hint={selectedClassId ? "Terdaftar di kelas" : "Total terdaftar"}
           testid="report-total-students"
         />
         <StatCard
           icon={ClipboardList}
           label="Tugas"
-          value={data.report?.total_assignments || 0}
-          hint="Aktif dan arsip"
+          value={totalAssignments}
+          hint={selectedClassId ? "Pada kelas terpilih" : "Aktif dan arsip"}
           testid="report-total-assignments"
         />
         <StatCard
           icon={Upload}
           label="Submission"
-          value={data.report?.total_submissions || 0}
-          hint="Masuk ke sistem"
+          value={submissions.length}
+          hint="Masuk sesuai filter"
           testid="report-total-submissions"
         />
         <StatCard
           icon={CheckCircle2}
           label="Dinilai"
-          value={data.report?.graded_submissions || 0}
-          hint="Siap direkap"
+          value={`${gradingRate}%`}
+          hint={`${gradedCount} dari ${submissions.length} submission`}
           testid="report-graded-submissions"
         />
       </div>
-      <Card className="rounded-md shadow-none" data-testid="report-export-card">
-        <CardContent className="flex flex-wrap items-center justify-between gap-4 p-6">
+
+      <section className="reports-insight-grid" data-testid="report-insights">
+        <article className="report-insight report-insight-amber">
+          <span><Clock /></span>
           <div>
-            <h2
-              className="font-display text-2xl font-semibold"
-              data-testid="report-export-title"
-            >
-              Rekap dan laporan
-            </h2>
-            <p
-              className="text-sm text-slate-500"
-              data-testid="report-export-description"
-            >
-              Unduh rekap nilai Excel untuk dokumentasi semester.
-            </p>
+            <small>Perlu ditindaklanjuti</small>
+            <strong data-testid="report-waiting-count">{waitingCount} submission</strong>
+            <p>Belum mendapat nilai dari dosen.</p>
           </div>
-          <Button
-            data-testid="report-export-grades-button"
-            onClick={exportGrades}
-          >
-            <Download /> Export nilai Excel
-          </Button>
+        </article>
+        <article className="report-insight report-insight-red">
+          <span><AlertTriangle /></span>
+          <div>
+            <small>Keterlambatan</small>
+            <strong data-testid="report-late-rate">{lateRate}% submission</strong>
+            <p>{lateCount} pengumpulan melewati deadline.</p>
+          </div>
+        </article>
+        <article className="report-insight report-insight-blue">
+          <span><BarChart3 /></span>
+          <div>
+            <small>Performa terbaik</small>
+            <strong data-testid="report-best-class">
+              {bestClass ? `${bestClass.rataRata} rata-rata` : "Belum tersedia"}
+            </strong>
+            <p>{bestClass?.name || "Nilai kelas belum dapat dibandingkan."}</p>
+          </div>
+        </article>
+      </section>
+
+      <div className="reports-chart-grid">
+        <Card className="report-chart-card report-trend-card" data-testid="report-trend-card">
+          <CardHeader className="report-chart-header">
+            <div>
+              <p>Aktivitas harian</p>
+              <CardTitle>Tren submission {trendDays} hari</CardTitle>
+            </div>
+            <Badge className="border-blue-200 bg-blue-50 text-blue-700">
+              {submissions.length} total
+            </Badge>
+          </CardHeader>
+          <CardContent className="report-chart-content">
+            <ResponsiveContainer width="100%" height={310}>
+              <AreaChart data={trendData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                <defs>
+                  <linearGradient id="reportSubmissionGradient" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#2563eb" stopOpacity={0.28} />
+                    <stop offset="95%" stopColor="#2563eb" stopOpacity={0.02} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid stroke="#e2e8f0" strokeDasharray="4 4" vertical={false} />
+                <XAxis dataKey="tanggal" tick={{ fontSize: 11, fill: "#64748b" }} tickLine={false} axisLine={false} minTickGap={22} />
+                <YAxis allowDecimals={false} tick={{ fontSize: 11, fill: "#64748b" }} tickLine={false} axisLine={false} />
+                <Tooltip />
+                <Legend iconType="circle" iconSize={8} />
+                <Area type="monotone" dataKey="masuk" name="Submission masuk" stroke="#2563eb" strokeWidth={3} fill="url(#reportSubmissionGradient)" />
+                <Area type="monotone" dataKey="dinilai" name="Sudah dinilai" stroke="#10b981" strokeWidth={2} fill="transparent" />
+                <Area type="monotone" dataKey="terlambat" name="Terlambat" stroke="#ef4444" strokeWidth={2} fill="transparent" />
+              </AreaChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+
+        <Card className="report-chart-card" data-testid="report-status-card">
+          <CardHeader className="report-chart-header">
+            <div>
+              <p>Komposisi pekerjaan</p>
+              <CardTitle>Status submission</CardTitle>
+            </div>
+          </CardHeader>
+          <CardContent className="report-chart-content report-status-content">
+            {statusData.length ? (
+              <>
+                <div className="report-donut-wrap">
+                  <ResponsiveContainer width="100%" height={230}>
+                    <PieChart>
+                      <Pie data={statusData} dataKey="value" nameKey="name" innerRadius={68} outerRadius={94} paddingAngle={3} stroke="none">
+                        {statusData.map((entry) => (
+                          <Cell key={entry.name} fill={REPORT_STATUS_COLORS[entry.name]} />
+                        ))}
+                      </Pie>
+                      <Tooltip formatter={(value) => [`${value} submission`, "Jumlah"]} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="report-donut-center" aria-hidden="true">
+                    <strong>{submissions.length}</strong>
+                    <span>Total</span>
+                  </div>
+                </div>
+                <div className="report-status-legend">
+                  {statusData.map((entry) => (
+                    <div key={entry.name}>
+                      <span style={{ backgroundColor: REPORT_STATUS_COLORS[entry.name] }} />
+                      <p>{entry.name}</p>
+                      <strong>{entry.value}</strong>
+                    </div>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="report-chart-empty">
+                <Upload />
+                <strong>Belum ada submission</strong>
+                <p>Grafik status akan muncul setelah mahasiswa mengumpulkan tugas.</p>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <Card className="report-chart-card" data-testid="report-class-performance-card">
+        <CardHeader className="report-chart-header report-performance-header">
+          <div>
+            <p>Perbandingan kelas</p>
+            <CardTitle>Rata-rata nilai dan ketuntasan penilaian</CardTitle>
+          </div>
+          <p>Skala 0–100 · arahkan kursor ke grafik untuk detail.</p>
+        </CardHeader>
+        <CardContent className="report-chart-content">
+          {classPerformance.length ? (
+            <ResponsiveContainer width="100%" height={Math.max(260, Math.min(560, classPerformance.length * 64))}>
+              <BarChart data={classPerformance} layout="vertical" margin={{ top: 10, right: 24, left: 24, bottom: 0 }}>
+                <CartesianGrid stroke="#e2e8f0" strokeDasharray="4 4" horizontal={false} />
+                <XAxis type="number" domain={[0, 100]} tick={{ fontSize: 11, fill: "#64748b" }} tickLine={false} axisLine={false} />
+                <YAxis type="category" dataKey="name" width={180} tick={{ fontSize: 11, fill: "#334155" }} tickLine={false} axisLine={false} />
+                <Tooltip formatter={(value, name) => [`${value}${name === "Ketuntasan penilaian" ? "%" : ""}`, name]} />
+                <Legend iconType="circle" iconSize={8} />
+                <Bar dataKey="rataRata" name="Rata-rata nilai" fill="#2563eb" radius={[0, 5, 5, 0]} barSize={14} />
+                <Bar dataKey="ketuntasan" name="Ketuntasan penilaian" fill="#10b981" radius={[0, 5, 5, 0]} barSize={14} />
+              </BarChart>
+            </ResponsiveContainer>
+          ) : (
+            <div className="report-chart-empty">
+              <BarChart3 />
+              <strong>Belum ada data kelas</strong>
+              <p>Perbandingan akan tersedia setelah kelas dan nilai dibuat.</p>
+            </div>
+          )}
         </CardContent>
       </Card>
     </div>
@@ -10113,6 +11463,116 @@ const SettingsPage = memo(function SettingsPage({
   );
 });
 
+function GuidePage({ role = "student", classes = [], onNavigate }) {
+  const isAdmin = role === "admin";
+  const isLecturer = role === "lecturer";
+  const title = isAdmin ? "Panduan Admin Kampus" : isLecturer ? "Panduan Dosen" : "Panduan Mahasiswa";
+  const intro = isAdmin
+    ? "Kelola struktur akademik, pengguna, dan penutupan semester secara tertib."
+    : isLecturer
+      ? "Ikuti urutan kerja kelas dari persiapan hingga finalisasi nilai."
+      : "Ikuti langkah sederhana untuk masuk kelas, belajar, mengumpulkan tugas, dan melihat nilai.";
+  const steps = isAdmin
+    ? [
+        ["1", "Siapkan struktur akademik", "Buat Prodi, Mata Kuliah, lalu kelas semester. Kode kelas dibuat otomatis."],
+        ["2", "Kelola pengguna", "Admin dapat membuat/import mahasiswa. Dosen hanya memilih mahasiswa aktif atau memproses request."],
+        ["3", "Pantau approval", "Request mahasiswa harus ditinjau dan disetujui sebelum mahasiswa melihat materi dan tugas kelas."],
+        ["4", "Tutup dan finalisasi", "Akhiri kelas ketika pembelajaran selesai, selesaikan koreksi, lalu ketik FINALISASI untuk mengunci rekap."],
+        ["5", "Arsip dan rollover", "Arsipkan kelas yang sudah difinalisasi. Tahun berikutnya selalu buat kelas baru dengan kode baru."],
+      ]
+    : isLecturer
+      ? [
+          ["1", "Buat kelas aktif", "Pilih Mata Kuliah, tahun akademik, semester, nama kelas, dan jadwal. Bagikan kode kelas."],
+          ["2", "Setujui anggota", "Buka menu Mahasiswa, tinjau request pending, lalu Approve atau Reject. Tambah langsung hanya untuk mahasiswa aktif."],
+          ["3", "Kelola pembelajaran", "Buat materi dan tugas hanya saat kelas Aktif. Atur bobot nilai dan kategori Tugas/UTS/UAS."],
+          ["4", "Koreksi submission", "Nilai, feedback, dan permintaan revisi tersedia selama kelas Aktif atau Berakhir. Submission baru ditutup setelah kelas diakhiri."],
+          ["5", "Finalisasi semester", "Pastikan seluruh komponen nilai lengkap, klik Finalisasi, ketik FINALISASI, lalu gunakan Arsip. Setelah itu data read-only."],
+        ]
+      : [
+          ["1", "Buat akun", "Daftar sebagai mahasiswa menggunakan NIM, email, dan password."],
+          ["2", "Gabung dengan kode", "Masukkan kode kelas. Status akan menjadi Menunggu ACC sampai dosen menyetujui."],
+          ["3", "Belajar dan mengumpulkan", "Setelah disetujui, buka Materi dan Tugas. Periksa deadline sebelum mengunggah file."],
+          ["4", "Tanggapi revisi", "Jika dosen meminta revisi, unggah ulang hanya pada tugas yang berstatus Direvisi."],
+          ["5", "Semester berikutnya", "Kelas lama menjadi arsip. Gunakan kode kelas baru untuk semester baru dan tunggu approval kembali."],
+        ];
+  const rules = [
+    "Aksi penting seperti mengakhiri kelas, finalisasi nilai, arsip, hapus data, import, dan perubahan bobot selalu membutuhkan konfirmasi.",
+    "Kelas Berakhir menutup anggota baru, materi baru, tugas baru, dan submission baru. Penilaian masih dapat diselesaikan sampai Finalisasi.",
+    "Kelas yang sudah Finalisasi/Arsip tidak boleh diubah. Untuk tahun berikutnya, buat kelas baru; histori kelas lama tetap tersimpan.",
+  ];
+  return (
+    <div className="space-y-6" data-testid={`${role}-guide-page`}>
+      <section className="meeting-hero" data-testid={`${role}-guide-hero`}>
+        <div>
+          <p className="meeting-overline">Panduan LMS</p>
+          <h2 className="font-display text-2xl font-semibold">{title}</h2>
+          <p className="meeting-description">{intro}</p>
+        </div>
+        <div className="meeting-summary">
+          <div><strong>{steps.length}</strong><span>Langkah utama</span></div>
+          <div><strong>{classes.length || "—"}</strong><span>Kelas terlihat</span></div>
+          <div><strong>1</strong><span>Alur semester</span></div>
+        </div>
+      </section>
+      <div className="grid gap-6 xl:grid-cols-[1.25fr_0.75fr]">
+        <Card className="rounded-md shadow-none" data-testid={`${role}-guide-steps-card`}>
+          <CardHeader>
+            <CardTitle>Urutan kerja yang disarankan</CardTitle>
+            <p className="text-sm text-slate-500">Ikuti dari atas ke bawah agar status kelas dan data nilai tetap konsisten.</p>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {steps.map(([number, heading, description]) => (
+              <div key={number} className="flex gap-3 border border-slate-200 bg-white p-4">
+                <Badge className="h-7 min-w-7 justify-center border-blue-200 bg-blue-50 text-blue-700">{number}</Badge>
+                <div><strong className="block text-slate-900">{heading}</strong><p className="mt-1 text-sm text-slate-600">{description}</p></div>
+              </div>
+            ))}
+          </CardContent>
+        </Card>
+        <Card className="rounded-md shadow-none" data-testid={`${role}-guide-rules-card`}>
+          <CardHeader>
+            <CardTitle>Aturan penting</CardTitle>
+          </CardHeader>
+          <CardContent className="space-y-3">
+            {rules.map((rule) => <div key={rule} className="flex gap-2 border border-amber-200 bg-amber-50 p-3 text-sm text-amber-900"><AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" /><span>{rule}</span></div>)}
+            {onNavigate && isAdmin && <Button type="button" variant="outline" onClick={() => onNavigate("classes")}><BookOpen /> Buka konfigurasi kelas</Button>}
+          </CardContent>
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function assignmentNeedsStudentAction(assignment) {
+  if (assignment.class_allows_learning === false) return false;
+  return (
+    !assignment.my_submission ||
+    assignment.my_submission?.status === "Direvisi" ||
+    assignment.my_submission?.review_status === "revision_requested"
+  );
+}
+
+function orderStudentAssignments(assignments) {
+  const actionRank = (assignment) => {
+    if (
+      assignment.my_submission?.status === "Direvisi" ||
+      assignment.my_submission?.review_status === "revision_requested"
+    )
+      return 0;
+    if (!assignment.my_submission) return 1;
+    return 2;
+  };
+  const deadlineTime = (assignment) => {
+    const value = new Date(assignment.deadline || 0).getTime();
+    return Number.isNaN(value) || value <= 0 ? Number.MAX_SAFE_INTEGER : value;
+  };
+  return [...assignments].sort((left, right) => {
+    const priority = actionRank(left) - actionRank(right);
+    if (priority) return priority;
+    return deadlineTime(left) - deadlineTime(right);
+  });
+}
+
 function buildAssignmentCourseGroups(assignments) {
   const ordered = [...assignments].sort((left, right) => {
     const classComparison = [left.course_name, left.class_name]
@@ -10142,6 +11602,8 @@ function buildAssignmentCourseGroups(assignments) {
           id: key,
           courseName: assignment.course_name || "Mata kuliah",
           className: assignment.class_name || "Kelas",
+          classStatus: assignment.class_status || "",
+          classStatusLabel: assignment.class_status_label || "",
           assignments: [],
         };
         items.push(group);
@@ -10149,26 +11611,43 @@ function buildAssignmentCourseGroups(assignments) {
       group.assignments.push(assignment);
       return items;
     }, [])
-    .map((group) => ({
-      ...group,
-      pending: group.assignments.filter(
-        (assignment) => !assignment.my_submission,
-      ).length,
-      revision: group.assignments.filter(
-        (assignment) =>
-          assignment.my_submission?.status === "Direvisi" ||
-          assignment.my_submission?.review_status === "revision_requested",
-      ).length,
-      graded: group.assignments.filter(
-        (assignment) =>
-          assignment.my_submission?.grade !== undefined &&
-          assignment.my_submission?.grade !== null,
-      ).length,
-      latestAssignment: group.assignments[group.assignments.length - 1],
-    }));
+    .map((group) => {
+      const orderedAssignments = orderStudentAssignments(group.assignments);
+      return {
+        ...group,
+        classStatus: group.classStatus || group.assignments[0]?.class_status || "",
+        classStatusLabel: group.classStatusLabel || group.assignments[0]?.class_status_label || "",
+        assignments: orderedAssignments,
+        pending: group.assignments.filter(
+        (assignment) => assignmentNeedsStudentAction(assignment),
+        ).length,
+        revision: group.assignments.filter(
+          (assignment) =>
+            assignment.my_submission?.status === "Direvisi" ||
+            assignment.my_submission?.review_status === "revision_requested",
+        ).length,
+        graded: group.assignments.filter(
+          (assignment) =>
+            assignment.my_submission?.grade !== undefined &&
+            assignment.my_submission?.grade !== null,
+        ).length,
+        latestAssignment: orderedAssignments[0],
+      };
+    })
+    .sort(
+      (left, right) =>
+        right.pending +
+        right.revision -
+        (left.pending + left.revision),
+    );
 }
 
-function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
+function StudentAssignmentsPage({
+  assignments,
+  renderAssignmentCard,
+  focusAssignmentId,
+  onFocusHandled,
+}) {
   const groups = useMemo(
     () => buildAssignmentCourseGroups(assignments),
     [assignments],
@@ -10176,12 +11655,10 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
   const [selectedGroupId, setSelectedGroupId] = useState("");
   const selectedGroup = groups.find((group) => group.id === selectedGroupId);
   const pendingAssignments = assignments.filter(
-    (assignment) => !assignment.my_submission,
+    (assignment) => assignmentNeedsStudentAction(assignment) && !assignment.my_submission,
   ).length;
   const revisionAssignments = assignments.filter(
-    (assignment) =>
-      assignment.my_submission?.status === "Direvisi" ||
-      assignment.my_submission?.review_status === "revision_requested",
+    (assignment) => assignmentNeedsStudentAction(assignment) && Boolean(assignment.my_submission),
   ).length;
 
   useEffect(() => {
@@ -10192,6 +11669,24 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
       setSelectedGroupId("");
     }
   }, [groups, selectedGroupId]);
+
+  useEffect(() => {
+    if (!focusAssignmentId) return undefined;
+    const focusedGroup = groups.find((group) =>
+      group.assignments.some(
+        (assignment) => assignment.id === focusAssignmentId,
+      ),
+    );
+    if (!focusedGroup) return undefined;
+    setSelectedGroupId(focusedGroup.id);
+    const timer = window.setTimeout(() => {
+      document
+        .getElementById(`assignment-${focusAssignmentId}`)
+        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      onFocusHandled?.();
+    }, 120);
+    return () => window.clearTimeout(timer);
+  }, [focusAssignmentId, groups, onFocusHandled]);
 
   function openGroup(groupId) {
     setSelectedGroupId(groupId);
@@ -10281,6 +11776,11 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
                           {group.pending + group.revision} perlu aksi
                         </Badge>
                       )}
+                      {group.classStatus && group.classStatus !== "active" && (
+                        <Badge className="border-slate-200 bg-slate-50 text-slate-700">
+                          {group.classStatusLabel || group.classStatus}
+                        </Badge>
+                      )}
                     </div>
                   </div>
                   <div className="course-material-stats">
@@ -10299,7 +11799,9 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
                   </div>
                   <div className="course-material-footer">
                     <p className="course-material-latest">
-                      {group.latestAssignment?.title || "Belum ada tugas"}
+                      {group.pending + group.revision > 0
+                        ? `Prioritas: ${group.latestAssignment?.title}`
+                        : group.latestAssignment?.title || "Belum ada tugas"}
                     </p>
                     <Button
                       type="button"
@@ -10342,6 +11844,11 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
             {selectedGroup.courseName}
           </h2>
           <p className="meeting-description">{selectedGroup.className}</p>
+          {selectedGroup.classStatus && selectedGroup.classStatus !== "active" && (
+            <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">
+              Kelas {selectedGroup.classStatusLabel || "sudah berakhir"}. Daftar tugas dan hasil tetap tersedia, tetapi pengumpulan baru ditutup.
+            </p>
+          )}
         </div>
         <div
           className="meeting-summary"
@@ -10361,6 +11868,26 @@ function StudentAssignmentsPage({ assignments, renderAssignmentCard }) {
           </div>
         </div>
       </section>
+      {selectedGroup.pending + selectedGroup.revision > 0 && (
+        <section
+          className="student-task-priority-banner"
+          data-testid="student-assignment-priority-banner"
+        >
+          <span className="student-task-priority-icon">
+            <AlertTriangle />
+          </span>
+          <div>
+            <strong>Mulai dari tugas yang perlu aksi</strong>
+            <p>
+              Tugas yang belum dikumpulkan atau diminta revisi ditampilkan
+              paling atas agar tidak terlewat.
+            </p>
+          </div>
+          <Badge className="border-amber-200 bg-white text-amber-700">
+            {selectedGroup.pending + selectedGroup.revision} perlu aksi
+          </Badge>
+        </section>
+      )}
       <div className="space-y-4" data-testid="student-assignment-list">
         {selectedGroup.assignments.map((assignment) =>
           renderAssignmentCard(assignment),
@@ -10619,6 +12146,7 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
   const [uploadMap, setUploadMap] = useState({});
   const [classCode, setClassCode] = useState("");
   const [studentPage, setStudentPage] = useState("home");
+  const [assignmentFocusId, setAssignmentFocusId] = useState("");
   const auth = useMemo(
     () => ({ headers: { Authorization: `Bearer ${token}` } }),
     [token],
@@ -10659,6 +12187,8 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
   }, []);
   async function requestJoinClass(event) {
     event.preventDefault();
+    if (!classCode.trim()) return toast.error("Masukkan kode kelas");
+    if (!window.confirm(`Kirim permintaan masuk ke kelas dengan kode ${classCode.trim().toUpperCase()}?`)) return;
     const operation = progress.begin("Mengirim permintaan kelas");
     try {
       await axios.post(
@@ -10697,6 +12227,9 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
     const selectedFiles = Array.from(fileMap[assignmentId] || []);
     if (!selectedFiles.length)
       return toast.error("Pilih minimal satu file tugas");
+    if (!window.confirm(
+      `${assignment?.my_submission ? "Kirim revisi" : "Kumpulkan tugas"} ${assignment?.title || "ini"} dengan ${selectedFiles.length} file? File tidak dapat diganti kecuali dosen meminta revisi.`,
+    )) return;
     const totalSize = selectedFiles.reduce(
       (sum, item) => sum + (item.size || 0),
       0,
@@ -10815,9 +12348,7 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
     }
   }
   const canSubmitAssignment = (assignment) =>
-    !assignment.my_submission ||
-    assignment.my_submission?.status === "Direvisi" ||
-    assignment.my_submission?.review_status === "revision_requested";
+    assignmentNeedsStudentAction(assignment);
   const assignmentMeta = (assignment) =>
     [
       assignment.course_name || "Mata kuliah",
@@ -10826,53 +12357,138 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
       .filter(Boolean)
       .join(" · ");
   const pendingAssignments = (data.assignments || []).filter(
-    (item) => !item.my_submission,
+    (item) => assignmentNeedsStudentAction(item) && !item.my_submission,
   ).length;
   const revisionAssignments = (data.assignments || []).filter(
-    (item) =>
-      item.my_submission?.status === "Direvisi" ||
-      item.my_submission?.review_status === "revision_requested",
+    (item) => assignmentNeedsStudentAction(item) && Boolean(item.my_submission),
   ).length;
   const gradedAssignments = (data.assignments || []).filter(
     (item) =>
       item.my_submission?.grade !== undefined &&
       item.my_submission?.grade !== null,
   ).length;
-  const studentActivityCount =
-    pendingAssignments +
-    revisionAssignments +
-    gradedAssignments +
-    (data.reminders || []).length;
+  const actionAssignments = orderStudentAssignments(
+    (data.assignments || []).filter(assignmentNeedsStudentAction),
+  );
+  const studentActionCount = actionAssignments.length;
+  const submittedAssignmentCount = (data.assignments || []).filter(
+    (item) => item.my_submission,
+  ).length;
+  const assignmentCompletion = data.assignments.length
+    ? Math.round((submittedAssignmentCount / data.assignments.length) * 100)
+    : 0;
+  const studentClassSummaries = useMemo(() => {
+    const classMap = new Map();
+    (data.assignments || []).forEach((assignment) => {
+      const key = assignment.class_id || assignment.class_name;
+      if (!key) return;
+      if (!classMap.has(key))
+        classMap.set(key, {
+          id: key,
+          class_name: assignment.class_name || "Kelas",
+          course_name: assignment.course_name || "Mata kuliah",
+          assignmentCount: 0,
+          submitted: 0,
+          graded: 0,
+        });
+      const entry = classMap.get(key);
+      entry.assignmentCount += 1;
+      if (assignment.my_submission) entry.submitted += 1;
+      if (assignment.my_submission?.grade != null) entry.graded += 1;
+    });
+    (data.enrollments || [])
+      .filter((request) => request.status === "approved")
+      .forEach((request) => {
+        if (!classMap.has(request.class_id))
+          classMap.set(request.class_id, {
+            id: request.class_id,
+            class_name: request.class_name || "Kelas",
+            course_name: request.course_name || "Mata kuliah",
+            assignmentCount: 0,
+            submitted: 0,
+            graded: 0,
+          });
+      });
+    return Array.from(classMap.values());
+  }, [data.assignments, data.enrollments]);
+  const nextPriorityAssignment = actionAssignments.find(
+    (assignment) =>
+      Number.isFinite(new Date(assignment.deadline).getTime()) &&
+      new Date(assignment.deadline).getTime() >= Date.now() - 3600000,
+  );
+  const studentUpcomingEvents = useMemo(
+    () =>
+      [...(data.calendar || [])]
+        .filter((event) => {
+          const date = new Date(event.date).getTime();
+          return Number.isFinite(date) && date >= Date.now() - 3600000;
+        })
+        .sort(
+          (left, right) =>
+            new Date(left.date).getTime() - new Date(right.date).getTime(),
+        )
+        .slice(0, 5),
+    [data.calendar],
+  );
+  const studentRecentGrades = useMemo(
+    () =>
+      (data.assignments || [])
+        .filter((assignment) => assignment.my_submission?.grade != null)
+        .sort(
+          (left, right) =>
+            new Date(
+              right.my_submission?.graded_at ||
+                right.my_submission?.updated_at ||
+                right.my_submission?.submitted_at ||
+                0,
+            ).getTime() -
+            new Date(
+              left.my_submission?.graded_at ||
+                left.my_submission?.updated_at ||
+                left.my_submission?.submitted_at ||
+                0,
+            ).getTime(),
+        )
+        .slice(0, 4),
+    [data.assignments],
+  );
   const nav = [
-    ["home", LayoutDashboard, "Ringkasan"],
+    ["home", LayoutDashboard, "Beranda"],
     ["courses", BookOpen, "Materi"],
     ["assignments", ClipboardList, "Tugas"],
     ["grades", CheckCircle2, "Nilai"],
     ["calendar", CalendarDays, "Kalender"],
     ["profile", Users, "Profil"],
+    ["guide", BookOpen, "Panduan LMS"],
   ];
   const pageTitle =
-    nav.find(([key]) => key === studentPage)?.[2] || "Ringkasan";
+    nav.find(([key]) => key === studentPage)?.[2] || "Beranda";
   const pageDescriptions = {
-    home: "Ringkasan aktivitas dan progres belajar Anda.",
+    home: "Tugas prioritas, kelas aktif, dan progres belajar Anda.",
     courses: "Materi kuliah tersusun berdasarkan mata kuliah.",
     assignments: "Kerjakan dan kumpulkan tugas pada satu tempat.",
     grades: "Lihat hasil penilaian dan umpan balik dosen.",
     calendar: "Pantau agenda serta deadline terdekat.",
     profile: "Kelola informasi dan keamanan akun Anda.",
+    guide: "Pahami alur kelas, approval, tugas, nilai, dan pergantian semester.",
   };
+  function openStudentAssignment(assignmentId) {
+    setAssignmentFocusId(assignmentId);
+    setStudentPage("assignments");
+  }
   const renderAssignmentCard = (a) => {
     const uploadState = uploadMap[a.id] || {};
-    const canSubmit = canSubmitAssignment(a);
+    const classReadOnly = a.class_allows_learning === false;
+    const canSubmit = canSubmitAssignment(a) && !classReadOnly;
     const submittedFiles = submissionFiles(a.my_submission);
-    const submitLabel = a.my_submission ? "Kirim revisi" : "Submit";
+    const submitLabel = a.my_submission ? "Kirim revisi" : "Kumpulkan tugas";
     const allowedFormats = assignmentAllowedFormats(a);
     const maxSubmissionMb = assignmentMaxSubmissionMb(a);
     return (
       <Card
         id={`assignment-${a.id}`}
         key={a.id}
-        className="rounded-md shadow-none scroll-mt-24"
+        className={`student-assignment-card rounded-md shadow-none scroll-mt-24 ${canSubmit ? "student-assignment-card-action" : "student-assignment-card-complete"}`}
         data-testid={`student-assignment-card-${a.id}`}
       >
         <CardContent className="p-5">
@@ -10911,13 +12527,10 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
                 )}
                 data-testid={`student-assignment-status-${a.id}`}
               >
-                {submissionStatusLabel(a.my_submission?.status)}
+                {a.my_submission
+                  ? submissionStatusLabel(a.my_submission?.status)
+                  : "Belum dikumpulkan"}
               </Badge>
-              {!a.my_submission && (
-                <Badge className="border-red-200 bg-red-50 text-red-700">
-                  Perlu submit
-                </Badge>
-              )}
               {a.my_submission?.review_status === "revision_requested" && (
                 <Badge className="border-amber-200 bg-amber-50 text-amber-700">
                   Revisi dibuka
@@ -10926,6 +12539,11 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               {a.my_submission?.grade != null && (
                 <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700">
                   Nilai tersedia
+                </Badge>
+              )}
+              {classReadOnly && (
+                <Badge className="border-slate-200 bg-slate-50 text-slate-700">
+                  {a.class_status_label || "Kelas berakhir"}
                 </Badge>
               )}
             </div>
@@ -11026,39 +12644,76 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
             </div>
           )}
           {canSubmit ? (
-            <div className="mt-4 grid gap-3 md:grid-cols-[1fr_1fr_auto]">
-              <Input
-                type="file"
-                multiple
-                accept={fileAcceptFromFormats(allowedFormats)}
-                disabled={uploadState.busy}
-                data-testid={`student-submit-file-${a.id}-input`}
-                onChange={(e) =>
-                  setFileMap({ ...fileMap, [a.id]: e.target.files })
-                }
-              />
-              <Input
-                placeholder="Catatan singkat"
-                value={noteMap[a.id] || ""}
-                disabled={uploadState.busy}
-                onChange={(e) =>
-                  setNoteMap({ ...noteMap, [a.id]: e.target.value })
-                }
-              />
-              <Button
-                onClick={() => submitAssignment(a.id)}
-                disabled={uploadState.busy}
-              >
-                <Send /> {uploadState.busy ? "Mengupload..." : submitLabel}
-              </Button>
-            </div>
+            <section
+              className="student-submit-panel"
+              data-testid={`student-submit-panel-${a.id}`}
+            >
+              <div className="student-submit-heading">
+                <span>
+                  <Upload />
+                </span>
+                <div>
+                  <strong>
+                    {a.my_submission ? "Kirim perbaikan tugas" : "Kumpulkan tugas"}
+                  </strong>
+                  <p>
+                    Ikuti urutan di bawah. File tidak akan dikirim sebelum Anda
+                    menekan tombol kumpulkan.
+                  </p>
+                </div>
+              </div>
+              <div className="student-submit-steps">
+                <label>
+                  <span>1. Pilih file</span>
+                  <Input
+                    type="file"
+                    multiple
+                    accept={fileAcceptFromFormats(allowedFormats)}
+                    disabled={uploadState.busy}
+                    data-testid={`student-submit-file-${a.id}-input`}
+                    onChange={(e) =>
+                      setFileMap({ ...fileMap, [a.id]: e.target.files })
+                    }
+                  />
+                  <small>
+                    {assignmentFormatLabel(a)} · maks. {maxSubmissionMb} MB per
+                    file
+                  </small>
+                </label>
+                <label>
+                  <span>2. Catatan (opsional)</span>
+                  <Input
+                    placeholder="Contoh: File revisi sesuai arahan dosen"
+                    value={noteMap[a.id] || ""}
+                    disabled={uploadState.busy}
+                    onChange={(e) =>
+                      setNoteMap({ ...noteMap, [a.id]: e.target.value })
+                    }
+                  />
+                </label>
+                <Button
+                  className="student-submit-button"
+                  onClick={() => submitAssignment(a.id)}
+                  disabled={uploadState.busy}
+                >
+                  <Send /> {uploadState.busy ? "Mengupload..." : `3. ${submitLabel}`}
+                </Button>
+              </div>
+            </section>
           ) : (
             <div
-              className="mt-4 rounded-md border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800"
+              className="student-submit-locked"
               data-testid={`student-submit-locked-${a.id}`}
             >
-              Tugas sudah berstatus submit. Pengiriman ulang akan dibuka jika
-              dosen mengembalikan tugas sebagai revisi.
+              <CheckCircle2 />
+              <div>
+                <strong>{classReadOnly ? "Pengumpulan ditutup" : "Tugas sudah dikumpulkan"}</strong>
+                <p>
+                  {classReadOnly
+                    ? "Kelas sudah berakhir atau difinalisasi. Anda masih dapat membaca instruksi dan melihat file yang sudah dikumpulkan."
+                    : "File terkunci agar tidak tertimpa. Pengiriman ulang akan terbuka jika dosen meminta revisi."}
+                </p>
+              </div>
             </div>
           )}
           {(uploadState.busy || uploadState.done || uploadState.error) && (
@@ -11214,12 +12869,12 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {studentActivityCount > 0 && (
+              {studentActionCount > 0 && (
                 <Badge
-                  className="border-red-200 bg-red-50 text-red-700"
+                  className="border-amber-200 bg-amber-50 text-amber-700"
                   data-testid="student-topbar-activity-badge"
                 >
-                  {studentActivityCount} aktivitas
+                  {studentActionCount} perlu aksi
                 </Badge>
               )}
               <Badge
@@ -11251,27 +12906,160 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
         >
           {studentPage === "home" && (
             <>
-              <section className="student-welcome-panel">
-                <div>
+              <section className="student-welcome-panel" data-testid="student-welcome-panel">
+                <div className="student-welcome-copy">
                   <p className="meeting-overline">Selamat datang kembali</p>
                   <h2>Halo, {user.name}</h2>
                   <p>
-                    Lanjutkan aktivitas belajar dan selesaikan tugas yang perlu
-                    perhatian.
+                    {studentActionCount > 0
+                      ? `${studentActionCount} tugas perlu perhatian. Mulai dari deadline terdekat.`
+                      : "Semua tugas sudah ditangani. Anda bisa melanjutkan materi berikutnya."}
                   </p>
+                  {nextPriorityAssignment && (
+                    <div className="student-next-deadline" data-testid="student-next-deadline">
+                      <CalendarDays />
+                      <div>
+                        <small>Deadline prioritas</small>
+                        <strong>{nextPriorityAssignment.title}</strong>
+                        <span>{fmtDate(nextPriorityAssignment.deadline)}</span>
+                      </div>
+                      <DeadlineCountdown deadline={nextPriorityAssignment.deadline} compact />
+                    </div>
+                  )}
                 </div>
-                <div className="student-quick-actions">
-                  <Button onClick={() => setStudentPage("assignments")}>
-                    <ClipboardList /> Lihat tugas
-                  </Button>
-                  <Button
-                    variant="outline"
-                    onClick={() => setStudentPage("courses")}
+                <div className="student-welcome-summary">
+                  <div
+                    className="student-completion-ring"
+                    style={{ "--student-progress": `${assignmentCompletion * 3.6}deg` }}
+                    data-testid="student-assignment-completion"
                   >
-                    <BookOpen /> Buka materi
-                  </Button>
+                    <div><strong>{assignmentCompletion}%</strong><span>tugas terkumpul</span></div>
+                  </div>
+                  <div className="student-quick-actions">
+                    <Button onClick={() => setStudentPage("assignments")}>
+                      <ClipboardList /> Lihat tugas
+                    </Button>
+                    <Button variant="outline" onClick={() => setStudentPage("courses")}>
+                      <BookOpen /> Buka materi
+                    </Button>
+                  </div>
                 </div>
               </section>
+              <Card
+                className={`student-focus-card rounded-md shadow-none ${studentActionCount === 0 ? "student-focus-card-complete" : ""}`}
+                data-testid="student-activity-card"
+              >
+                <CardHeader className="student-focus-header">
+                  <div>
+                    <p className="meeting-overline">
+                      {studentActionCount > 0 ? "Prioritas hari ini" : "Status tugas"}
+                    </p>
+                    <CardTitle data-testid="student-activity-title">
+                      {studentActionCount > 0
+                        ? "Yang perlu Anda kerjakan"
+                        : "Semua tugas sudah ditangani"}
+                    </CardTitle>
+                    <p
+                      className="student-focus-description"
+                      data-testid="student-activity-summary"
+                    >
+                      {studentActionCount > 0
+                        ? "Urutan dibuat berdasarkan revisi dan deadline terdekat."
+                        : "Tidak ada tugas baru atau revisi yang menunggu."}
+                    </p>
+                  </div>
+                  <div className="student-focus-badges">
+                    <Badge
+                      className="border-red-200 bg-white text-red-700"
+                      data-testid="student-activity-pending"
+                    >
+                      {pendingAssignments} belum dikumpulkan
+                    </Badge>
+                    <Badge
+                      className="border-amber-200 bg-white text-amber-700"
+                      data-testid="student-activity-revision"
+                    >
+                      {revisionAssignments} revisi
+                    </Badge>
+                    <Badge
+                      className="border-emerald-200 bg-white text-emerald-700"
+                      data-testid="student-activity-graded"
+                    >
+                      {gradedAssignments} dinilai
+                    </Badge>
+                    <Badge
+                      className="border-blue-200 bg-white text-blue-700"
+                      data-testid="student-activity-reminders"
+                    >
+                      {data.reminders.length} pengingat
+                    </Badge>
+                  </div>
+                </CardHeader>
+                {studentActionCount > 0 && (
+                  <CardContent className="student-focus-list">
+                    {actionAssignments.slice(0, 3).map((assignment) => {
+                      const isRevision =
+                        assignment.my_submission?.status === "Direvisi" ||
+                        assignment.my_submission?.review_status ===
+                          "revision_requested";
+                      return (
+                        <article
+                          key={assignment.id}
+                          className="student-focus-item"
+                          data-testid={`student-focus-assignment-${assignment.id}`}
+                        >
+                          <span className="student-focus-item-icon">
+                            {isRevision ? <Reply /> : <AlertTriangle />}
+                          </span>
+                          <div className="student-focus-item-copy">
+                            <div className="student-focus-item-title-row">
+                              <strong>{assignment.title}</strong>
+                              <Badge
+                                className={
+                                  isRevision
+                                    ? "border-amber-200 bg-amber-50 text-amber-700"
+                                    : "border-red-200 bg-red-50 text-red-700"
+                                }
+                              >
+                                {isRevision ? "Perlu revisi" : "Belum dikumpulkan"}
+                              </Badge>
+                            </div>
+                            <p>
+                              {[assignment.course_name, assignment.class_name]
+                                .filter(Boolean)
+                                .join(" · ")}
+                            </p>
+                            <div className="student-focus-deadline">
+                              <CalendarDays /> {fmtDate(assignment.deadline)}
+                              <DeadlineCountdown
+                                deadline={assignment.deadline}
+                                compact
+                                testid={`student-focus-deadline-${assignment.id}`}
+                              />
+                            </div>
+                          </div>
+                          <Button
+                            variant="outline"
+                            onClick={() => openStudentAssignment(assignment.id)}
+                            data-testid={`student-focus-open-${assignment.id}-button`}
+                          >
+                            Buka tugas
+                          </Button>
+                        </article>
+                      );
+                    })}
+                    {studentActionCount > 3 && (
+                      <Button
+                        variant="ghost"
+                        className="student-focus-see-all"
+                        onClick={() => setStudentPage("assignments")}
+                      >
+                        Lihat {studentActionCount - 3} tugas lainnya
+                      </Button>
+                    )}
+                  </CardContent>
+                )}
+              </Card>
               <Card
                 className="rounded-md shadow-none lg:hidden"
                 data-testid="student-mobile-join-card"
@@ -11311,160 +13099,63 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
                   </div>
                 </CardContent>
               </Card>
-              {(() => {
-                const approvedEnrollments = data.enrollments.filter(
-                  (r) => r.status === "approved",
-                );
-                const classMap = new Map();
-                data.assignments.forEach((a) => {
-                  const key = a.class_id || a.class_name;
-                  if (!key) return;
-                  if (!classMap.has(key))
-                    classMap.set(key, {
-                      class_name: a.class_name || "Kelas",
-                      course_name: a.course_name || "Mata kuliah",
-                      assignmentCount: 0,
-                      submitted: 0,
-                    });
-                  const entry = classMap.get(key);
-                  entry.assignmentCount += 1;
-                  if (a.my_submission) entry.submitted += 1;
-                });
-                approvedEnrollments.forEach((r) => {
-                  if (!classMap.has(r.class_id))
-                    classMap.set(r.class_id, {
-                      class_name: r.class_name || "Kelas",
-                      course_name: "",
-                      assignmentCount: 0,
-                      submitted: 0,
-                    });
-                });
-                const classes = Array.from(classMap.values());
-                return (
-                  <Card
-                    className="rounded-md shadow-none"
-                    data-testid="student-my-classes-card"
-                  >
-                    <CardHeader>
-                      <CardTitle data-testid="student-my-classes-title">
-                        Kelas & Mata Kuliah Saya
-                      </CardTitle>
-                    </CardHeader>
-                    <CardContent>
-                      {classes.length === 0 ? (
-                        <p
-                          className="text-sm text-slate-500"
-                          data-testid="student-my-classes-empty"
-                        >
-                          Belum ada kelas aktif. Masukkan kode kelas di sidebar
-                          untuk bergabung.
-                        </p>
-                      ) : (
-                        <div
-                          className="grid gap-3 md:grid-cols-2"
-                          data-testid="student-my-classes-grid"
-                        >
-                          {classes.map((cls, idx) => (
-                            <div
-                              key={idx}
-                              className="flex items-start gap-3 rounded-lg border border-slate-200 p-4"
-                              data-testid={`student-class-card-${idx}`}
-                            >
-                              <div className="rounded-lg bg-blue-50 p-2 text-blue-700">
-                                <BookOpen className="h-5 w-5" />
+              <Card className="student-classes-overview-card rounded-md shadow-none" data-testid="student-my-classes-card">
+                <CardHeader className="student-class-card-header">
+                  <CardTitle data-testid="student-my-classes-title">Kelas aktif</CardTitle>
+                  <p>Progres tugas pada setiap kelas yang sedang Anda ikuti.</p>
+                </CardHeader>
+                <CardContent>
+                  {studentClassSummaries.length === 0 ? (
+                    <p className="text-sm text-slate-500" data-testid="student-my-classes-empty">
+                      Belum ada kelas aktif. Masukkan kode kelas di sidebar untuk bergabung.
+                    </p>
+                  ) : (
+                    <div className="student-class-summary-grid" data-testid="student-my-classes-grid">
+                      {studentClassSummaries.map((cls, idx) => {
+                        const completion = cls.assignmentCount
+                          ? Math.round((cls.submitted / cls.assignmentCount) * 100)
+                          : 0;
+                        return (
+                          <article key={cls.id || idx} data-testid={`student-class-card-${idx}`}>
+                            <span className="student-class-summary-icon"><BookOpen /></span>
+                            <div className="student-class-summary-copy">
+                              <div>
+                                <strong data-testid={`student-class-course-${idx}`}>{cls.course_name}</strong>
+                                <p data-testid={`student-class-name-${idx}`}>{cls.class_name}</p>
                               </div>
-                              <div className="flex-1 min-w-0">
-                                <p
-                                  className="font-semibold truncate"
-                                  data-testid={`student-class-course-${idx}`}
-                                >
-                                  {cls.course_name}
-                                </p>
-                                <p
-                                  className="text-sm text-slate-500 truncate"
-                                  data-testid={`student-class-name-${idx}`}
-                                >
-                                  {cls.class_name}
-                                </p>
-                              </div>
-                              {cls.assignmentCount > 0 && (
-                                <Badge
-                                  className="shrink-0 border-blue-200 bg-blue-50 text-blue-700"
-                                  data-testid={`student-class-assignment-count-${idx}`}
-                                >
-                                  {cls.submitted}/{cls.assignmentCount} tugas
-                                </Badge>
-                              )}
+                              <Badge className="border-blue-200 bg-blue-50 text-blue-700" data-testid={`student-class-assignment-count-${idx}`}>
+                                {cls.submitted}/{cls.assignmentCount} tugas
+                              </Badge>
+                              <div className="student-class-progress"><span style={{ width: `${completion}%` }} /></div>
+                              <small>{completion}% terkumpul · {cls.graded} nilai tersedia</small>
                             </div>
-                          ))}
-                        </div>
-                      )}
-                    </CardContent>
-                  </Card>
-                );
-              })()}
-              {studentActivityCount > 0 && (
-                <Card
-                  className="rounded-md border-red-200 bg-red-50 shadow-none"
-                  data-testid="student-activity-card"
-                >
-                  <CardContent className="flex flex-wrap items-center justify-between gap-4 p-5">
-                    <div>
-                      <p
-                        className="font-display text-xl font-semibold text-red-800"
-                        data-testid="student-activity-title"
-                      >
-                        Aktivitas tugas
-                      </p>
-                      <p
-                        className="text-sm text-red-700"
-                        data-testid="student-activity-summary"
-                      >
-                        Ada tugas atau notifikasi yang perlu diperiksa.
-                      </p>
+                          </article>
+                        );
+                      })}
                     </div>
-                    <div className="flex flex-wrap gap-2">
-                      <Badge
-                        className="border-red-200 bg-white text-red-700"
-                        data-testid="student-activity-pending"
-                      >
-                        {pendingAssignments} belum submit
-                      </Badge>
-                      <Badge
-                        className="border-amber-200 bg-white text-amber-700"
-                        data-testid="student-activity-revision"
-                      >
-                        {revisionAssignments} revisi
-                      </Badge>
-                      <Badge
-                        className="border-emerald-200 bg-white text-emerald-700"
-                        data-testid="student-activity-graded"
-                      >
-                        {gradedAssignments} nilai
-                      </Badge>
-                      <Badge
-                        className="border-blue-200 bg-white text-blue-700"
-                        data-testid="student-activity-reminders"
-                      >
-                        {data.reminders.length} reminder
-                      </Badge>
-                    </div>
-                  </CardContent>
-                </Card>
-              )}
-              <div className="grid gap-4 md:grid-cols-4">
+                  )}
+                </CardContent>
+              </Card>
+              <div className="student-home-section-heading">
+                <div>
+                  <p className="meeting-overline">Perkembangan Anda</p>
+                  <h2>Progres belajar</h2>
+                </div>
+                <p>Ringkasan pengumpulan dan nilai pada semester berjalan.</p>
+              </div>
+              <div className="student-progress-grid grid gap-4 md:grid-cols-4">
                 <StatCard
                   icon={ClipboardList}
-                  label="Sudah submit"
-                  value={data.progress?.progress?.submitted || 0}
-                  hint="Submission terkirim"
+                  label="Progres tugas"
+                  value={`${assignmentCompletion}%`}
+                  hint={`${submittedAssignmentCount} dari ${data.assignments.length} tugas`}
                   testid="student-stat-submitted"
                 />
                 <StatCard
                   icon={AlertTriangle}
-                  label="Belum submit"
-                  value={data.progress?.progress?.missing || 0}
-                  hint="Segera kerjakan"
+                  label="Perlu aksi"
+                  value={studentActionCount}
+                  hint={`${revisionAssignments} revisi · ${pendingAssignments} belum submit`}
                   testid="student-stat-missing"
                 />
                 <StatCard
@@ -11475,35 +13166,49 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
                   testid="student-stat-grade"
                 />
                 <StatCard
-                  icon={Bell}
-                  label="Reminder"
-                  value={data.reminders.length}
-                  hint="Notifikasi aplikasi"
+                  icon={GraduationCap}
+                  label="Nilai tersedia"
+                  value={gradedAssignments}
+                  hint={`${data.reminders.length} pengingat diterima`}
                   testid="student-stat-reminders"
                 />
               </div>
-              <Card
-                className="rounded-md shadow-none"
-                data-testid="student-calendar-card"
-              >
-                <CardHeader>
-                  <CardTitle>Deadline terdekat</CardTitle>
-                </CardHeader>
-                <CardContent className="space-y-3">
-                  {data.calendar.length === 0 ? (
-                    <p className="text-sm text-slate-500">
-                      Belum ada deadline.
-                    </p>
-                  ) : (
-                    data.calendar.slice(0, 5).map((e) => (
-                      <div className="text-sm" key={e.id}>
-                        <p className="font-semibold">{e.title}</p>
-                        <p className="text-slate-500">{fmtDate(e.date)}</p>
-                      </div>
-                    ))
-                  )}
-                </CardContent>
-              </Card>
+              <div className="student-dashboard-detail-grid">
+                <Card className="student-dashboard-detail-card rounded-md shadow-none" data-testid="student-calendar-card">
+                  <CardHeader className="student-dashboard-detail-header">
+                    <div><p>Jadwal belajar</p><CardTitle>Deadline terdekat</CardTitle></div>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setStudentPage("calendar")}>Kalender</Button>
+                  </CardHeader>
+                  <CardContent className="student-dashboard-agenda-list">
+                    {studentUpcomingEvents.length === 0 ? (
+                      <div className="student-dashboard-empty"><CalendarDays /><strong>Belum ada deadline</strong><p>Agenda baru akan muncul di sini.</p></div>
+                    ) : studentUpcomingEvents.map((event) => (
+                      <article key={`${event.type}-${event.id}`}>
+                        <span><CalendarDays /></span>
+                        <div><strong>{event.title}</strong><p>{fmtDate(event.date)}</p></div>
+                        <Badge className={event.type === "deadline" ? "border-amber-200 bg-amber-50 text-amber-700" : "border-blue-200 bg-blue-50 text-blue-700"}>{event.type === "deadline" ? "Deadline" : "Agenda"}</Badge>
+                      </article>
+                    ))}
+                  </CardContent>
+                </Card>
+
+                <Card className="student-dashboard-detail-card rounded-md shadow-none" data-testid="student-latest-grades-card">
+                  <CardHeader className="student-dashboard-detail-header">
+                    <div><p>Hasil terbaru</p><CardTitle>Nilai dan feedback</CardTitle></div>
+                    <Button type="button" variant="ghost" size="sm" onClick={() => setStudentPage("grades")}>Semua nilai</Button>
+                  </CardHeader>
+                  <CardContent className="student-latest-grade-list">
+                    {studentRecentGrades.length === 0 ? (
+                      <div className="student-dashboard-empty"><GraduationCap /><strong>Belum ada nilai</strong><p>Nilai dari dosen akan muncul di sini.</p></div>
+                    ) : studentRecentGrades.map((assignment) => (
+                      <article key={assignment.id}>
+                        <div><strong>{assignment.title}</strong><p>{[assignment.course_name, assignment.class_name].filter(Boolean).join(" · ")}</p><small>{assignment.my_submission?.feedback || "Belum ada feedback tertulis."}</small></div>
+                        <span><strong>{assignment.my_submission.grade}</strong><small>{assignment.my_submission.grade_predicate || "Nilai"}</small></span>
+                      </article>
+                    ))}
+                  </CardContent>
+                </Card>
+              </div>
             </>
           )}
           {studentPage === "courses" && (
@@ -11525,6 +13230,8 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
             <StudentAssignmentsPage
               assignments={data.assignments}
               renderAssignmentCard={renderAssignmentCard}
+              focusAssignmentId={assignmentFocusId}
+              onFocusHandled={() => setAssignmentFocusId("")}
             />
           )}
           {studentPage === "calendar" && (
@@ -11538,6 +13245,7 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               enrollments={data.enrollments}
             />
           )}
+          {studentPage === "guide" && <GuidePage role="student" classes={studentClassSummaries} />}
         </section>
       </main>
       <nav

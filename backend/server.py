@@ -648,6 +648,59 @@ DEFAULT_GRADE_PREDICATES = [
     {"label": "E", "min_score": 0, "max_score": 49.99},
 ]
 
+DEFAULT_GRADE_WEIGHTS = {
+    "tugas": 25.0,
+    "uts": 35.0,
+    "uas": 40.0,
+}
+GRADE_WEIGHT_COMPONENTS = tuple(DEFAULT_GRADE_WEIGHTS.keys())
+
+CLASS_STATUS_ACTIVE = "active"
+CLASS_STATUS_ENDED = "ended"
+CLASS_STATUS_FINALIZED = "finalized"
+CLASS_STATUS_ARCHIVED = "archived"
+CLASS_STATUS_DELETED = "deleted"
+CLASS_STATUSES_READ_ONLY = {CLASS_STATUS_FINALIZED, CLASS_STATUS_ARCHIVED}
+
+
+def normalize_assessment_category(value: Any) -> str:
+    category = str(value or "tugas").strip().lower()
+    aliases = {
+        "assignment": "tugas",
+        "task": "tugas",
+        "midterm": "uts",
+        "final": "uas",
+        "final_exam": "uas",
+    }
+    category = aliases.get(category, category)
+    if category not in GRADE_WEIGHT_COMPONENTS:
+        raise HTTPException(status_code=400, detail="Komponen nilai harus Tugas, UTS, atau UAS")
+    return category
+
+
+def grade_weights_from_document(value: Any) -> Dict[str, float]:
+    if not isinstance(value, dict):
+        return dict(DEFAULT_GRADE_WEIGHTS)
+    return {
+        component: round(float(value.get(component, DEFAULT_GRADE_WEIGHTS[component])), 2)
+        for component in GRADE_WEIGHT_COMPONENTS
+    }
+
+
+def validate_grade_weights(value: Dict[str, Any]) -> Dict[str, float]:
+    cleaned: Dict[str, float] = {}
+    for component in GRADE_WEIGHT_COMPONENTS:
+        try:
+            weight = float(value.get(component, 0))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"Bobot {component.upper()} harus berupa angka") from exc
+        if weight < 0 or weight > 100:
+            raise HTTPException(status_code=400, detail=f"Bobot {component.upper()} harus berada di antara 0 dan 100")
+        cleaned[component] = round(weight, 2)
+    if abs(sum(cleaned.values()) - 100) > 0.01:
+        raise HTTPException(status_code=400, detail="Total bobot Tugas, UTS, dan UAS harus tepat 100%")
+    return cleaned
+
 
 def default_whatsapp_settings() -> Dict[str, Any]:
     return {
@@ -1046,6 +1099,48 @@ async def get_manageable_class(class_id: str, active_only: bool = False, user: O
     return class_doc
 
 
+def class_status_label(status: str) -> str:
+    return {
+        CLASS_STATUS_ACTIVE: "Aktif",
+        CLASS_STATUS_ENDED: "Berakhir",
+        CLASS_STATUS_FINALIZED: "Nilai difinalisasi",
+        CLASS_STATUS_ARCHIVED: "Arsip",
+        CLASS_STATUS_DELETED: "Dihapus",
+    }.get(status, "Tidak diketahui")
+
+
+def class_is_read_only(class_doc: Dict[str, Any]) -> bool:
+    return class_doc.get("status") in CLASS_STATUSES_READ_ONLY
+
+
+def class_allows_learning(class_doc: Dict[str, Any]) -> bool:
+    return class_doc.get("status") == CLASS_STATUS_ACTIVE
+
+
+def class_allows_grading(class_doc: Dict[str, Any]) -> bool:
+    return class_doc.get("status") in {CLASS_STATUS_ACTIVE, CLASS_STATUS_ENDED}
+
+
+async def require_class_mutation_access(class_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
+    class_doc = await require_class_access(class_id, user)
+    if not class_allows_learning(class_doc):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Kelas {class_status_label(class_doc.get('status', ''))} bersifat read-only. Buat kelas baru untuk semester berikutnya.",
+        )
+    return class_doc
+
+
+async def require_class_grading_access(class_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
+    class_doc = await require_class_access(class_id, user)
+    if not class_allows_grading(class_doc):
+        raise HTTPException(
+            status_code=409,
+            detail=f"Penilaian tidak dapat diubah karena kelas berstatus {class_status_label(class_doc.get('status', ''))}.",
+        )
+    return class_doc
+
+
 async def get_active_student(student_id: str) -> Dict[str, Any]:
     student = await db.users.find_one({"id": student_id, "role": "student"}, {"_id": 0})
     if not student:
@@ -1317,11 +1412,25 @@ async def require_class_access(class_id: str, user: Dict[str, Any], active_only:
     return class_doc
 
 
+async def require_course_access(course_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
+    course = await db.courses.find_one({"id": course_id, "status": {"$ne": "deleted"}}, {"_id": 0})
+    if not course:
+        raise HTTPException(status_code=404, detail="Mata kuliah tidak ditemukan")
+    if user.get("role") == "lecturer":
+        owned_class = await db.classes.find_one(
+            {"course_id": course_id, "lecturer_id": user["id"], "status": {"$ne": "deleted"}},
+            {"_id": 0, "id": 1},
+        )
+        if not owned_class:
+            raise HTTPException(status_code=404, detail="Mata kuliah bukan bagian dari kelas yang Anda kelola")
+    return course
+
+
 async def require_submission_access(submission_id: str, user: Dict[str, Any]) -> Dict[str, Any]:
     submission = await db.submissions.find_one({"id": submission_id}, {"_id": 0})
     if not submission:
         raise HTTPException(status_code=404, detail="Submission tidak ditemukan")
-    await require_class_access(submission.get("class_id", ""), user)
+    await require_class_grading_access(submission.get("class_id", ""), user)
     return submission
 
 
@@ -1495,6 +1604,14 @@ class ClassInput(BaseModel):
     schedule: str = ""
 
 
+class ClassDuplicateInput(BaseModel):
+    academic_year: str = Field(min_length=1)
+    semester: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    schedule: str = ""
+    confirmation: str = ""
+
+
 class StudentInput(BaseModel):
     nim: str
     name: str
@@ -1573,6 +1690,7 @@ class AssignmentInput(BaseModel):
     max_file_size_mb: float = Field(default=DEFAULT_SUBMISSION_MAX_FILE_MB, gt=0)
     rubric: List[RubricItem] = Field(default_factory=list)
     assignment_type: str = "individu"
+    assessment_category: str = "tugas"
     allow_revision: bool = True
     is_active: bool = True
     is_practicum: bool = False
@@ -1607,6 +1725,16 @@ class GradePredicateItem(BaseModel):
 class GradePredicateInput(BaseModel):
     class_id: str = ""
     predicates: List[GradePredicateItem]
+
+
+class GradeWeightsInput(BaseModel):
+    tugas: float = Field(default=25, ge=0, le=100)
+    uts: float = Field(default=35, ge=0, le=100)
+    uas: float = Field(default=40, ge=0, le=100)
+
+
+class FinalizationInput(BaseModel):
+    confirmation: str = Field(default="")
 
 
 class CleanDataInput(BaseModel):
@@ -1898,6 +2026,33 @@ async def ensure_multi_lecturer_schema() -> None:
                 {"class_id": class_id, "$or": [{"lecturer_id": {"$exists": False}}, {"lecturer_id": ""}, {"lecturer_id": None}]},
                 {"$set": {"lecturer_id": owner_id, "lecturer_name": owner_name}},
             )
+
+
+async def ensure_class_lifecycle_schema() -> None:
+    """Backfill lifecycle fields for classes created before finalization support."""
+    async for class_doc in db.classes.find(
+        {
+            "status": {"$in": [CLASS_STATUS_ENDED, CLASS_STATUS_FINALIZED, CLASS_STATUS_ARCHIVED]},
+            "$or": [
+                {"grade_weights_snapshot": {"$exists": False}},
+                {"grade_weights_snapshot_customized": {"$exists": False}},
+            ],
+        },
+        {"_id": 0, "id": 1, "course_id": 1, "grade_weights_snapshot": 1},
+    ):
+        course = await db.courses.find_one({"id": class_doc.get("course_id")}, {"_id": 0, "grade_weights": 1}) or {}
+        await db.classes.update_one(
+            {"id": class_doc["id"]},
+            {
+                "$set": {
+                    "grade_weights_snapshot": grade_weights_from_document(
+                        class_doc.get("grade_weights_snapshot") or course.get("grade_weights")
+                    ),
+                    "grade_weights_snapshot_customized": isinstance(course.get("grade_weights"), dict),
+                    "lifecycle_migrated_at": now_iso(),
+                }
+            },
+        )
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -2951,12 +3106,19 @@ async def enrich_class_payload(class_doc: Dict[str, Any]) -> Dict[str, Any]:
     class_doc["program_id"] = course.get("program_id", class_doc.get("program_id", "")) if course else class_doc.get("program_id", "")
     class_doc["program_name"] = course.get("program_name", class_doc.get("program_name", "")) if course else class_doc.get("program_name", "")
     class_doc["student_count"] = len(class_doc.get("student_ids", []))
+    class_doc["status_label"] = class_status_label(class_doc.get("status", CLASS_STATUS_ACTIVE))
+    class_doc["read_only"] = class_is_read_only(class_doc)
+    class_doc["allows_learning"] = class_allows_learning(class_doc)
+    class_doc["allows_grading"] = class_allows_grading(class_doc)
     return class_doc
 
 
 async def enrich_course_payload(course_doc: Dict[str, Any]) -> Dict[str, Any]:
     program = await db.programs.find_one({"id": course_doc.get("program_id")}, {"_id": 0})
     course_doc["program_name"] = program.get("name", course_doc.get("program_name", "")) if program else course_doc.get("program_name", "")
+    customized = isinstance(course_doc.get("grade_weights"), dict)
+    course_doc["grade_weights"] = grade_weights_from_document(course_doc.get("grade_weights"))
+    course_doc["grade_weights_customized"] = customized
     return course_doc
 
 
@@ -2974,6 +3136,10 @@ async def enrich_material_payload(material_doc: Dict[str, Any]) -> Dict[str, Any
             "class_name": class_doc.get("name") or linked_assignment.get("class_name", ""),
             "class_code": class_doc.get("class_code", ""),
             "class_status": class_doc.get("status", ""),
+            "class_status_label": class_doc.get("status_label") or class_status_label(class_doc.get("status", "")),
+            "class_read_only": bool(class_doc.get("read_only", class_is_read_only(class_doc))),
+            "class_allows_learning": bool(class_doc.get("allows_learning", class_allows_learning(class_doc))),
+            "class_allows_grading": bool(class_doc.get("allows_grading", class_allows_grading(class_doc))),
             "course_id": class_doc.get("course_id") or linked_assignment.get("course_id", ""),
             "course_name": class_doc.get("course_name") or linked_assignment.get("course_name", ""),
             "academic_year": class_doc.get("academic_year", ""),
@@ -3018,6 +3184,10 @@ async def enrich_materials_batch(materials: List[Dict[str, Any]]) -> List[Dict[s
             "class_name": class_doc.get("name") or linked.get("class_name", ""),
             "class_code": class_doc.get("class_code", ""),
             "class_status": class_doc.get("status", ""),
+            "class_status_label": class_status_label(class_doc.get("status", "")),
+            "class_read_only": class_is_read_only(class_doc),
+            "class_allows_learning": class_allows_learning(class_doc),
+            "class_allows_grading": class_allows_grading(class_doc),
             "course_id": class_doc.get("course_id") or linked.get("course_id", ""),
             "course_name": class_doc.get("course_name") or linked.get("course_name", ""),
             "academic_year": class_doc.get("academic_year", ""),
@@ -3430,14 +3600,23 @@ async def change_password(payload: ChangePasswordInput, user: Dict[str, Any] = D
 
 @api_router.post("/auth/join-class")
 async def join_class(payload: JoinClassInput):
+    """Legacy registration endpoint kept for compatibility.
+
+    It no longer grants class membership directly. New and existing students
+    are signed in without the class link and receive a pending enrollment
+    request that must be approved by the lecturer/admin.
+    """
     class_code = clean_code(payload.class_code)
     class_doc = await db.classes.find_one({"class_code": class_code, "status": "active"}, {"_id": 0})
     if not class_doc:
         raise HTTPException(status_code=404, detail="Kode kelas tidak ditemukan")
     existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
     if existing:
+        if existing.get("role") != "student":
+            raise HTTPException(status_code=409, detail="Email sudah digunakan oleh akun non-mahasiswa")
+        if not verify_password(payload.password, existing.get("password_hash", "")):
+            raise HTTPException(status_code=401, detail="Password akun mahasiswa salah")
         student_id = existing["id"]
-        await db.users.update_one({"id": student_id}, {"$addToSet": {"class_ids": class_doc["id"]}})
     else:
         student_id = new_id()
         await db.users.insert_one(
@@ -3450,13 +3629,41 @@ async def join_class(payload: JoinClassInput):
                 "whatsapp": payload.whatsapp,
                 "password_hash": hash_password(payload.password),
                 "status": "active",
-                "class_ids": [class_doc["id"]],
+                "class_ids": [],
                 "created_at": now_iso(),
                 "last_login_at": "",
             }
         )
-    await db.classes.update_one({"id": class_doc["id"]}, {"$addToSet": {"student_ids": student_id}})
-    return await login(LoginInput(identifier=payload.email, password=payload.password))
+    already_joined = bool(existing and class_doc["id"] in existing.get("class_ids", []))
+    if already_joined:
+        login_response = await login(LoginInput(identifier=payload.email, password=payload.password))
+        login_response["enrollment_status"] = "approved"
+        return login_response
+    request_doc = await db.enrollment_requests.find_one(
+        {"class_id": class_doc["id"], "student_id": student_id, "status": "pending"},
+        {"_id": 0},
+    )
+    if not request_doc:
+        request_doc = {
+            "id": new_id(),
+            "class_id": class_doc["id"],
+            "class_name": class_doc["name"],
+            "class_code": class_doc.get("class_code", ""),
+            "lecturer_id": class_doc.get("lecturer_id", ""),
+            "lecturer_name": class_doc.get("lecturer_name", ""),
+            "student_id": student_id,
+            "student_name": (existing or {}).get("name") or payload.name,
+            "student_nim": (existing or {}).get("nim") or payload.nim,
+            "student_email": payload.email.lower(),
+            "status": "pending",
+            "requested_at": now_iso(),
+            "source": "legacy_join_class",
+        }
+        await db.enrollment_requests.insert_one(request_doc)
+    login_response = await login(LoginInput(identifier=payload.email, password=payload.password))
+    login_response["enrollment_status"] = "pending"
+    login_response["enrollment_request_id"] = request_doc["id"]
+    return login_response
 
 
 @api_router.get("/auth/me")
@@ -3874,7 +4081,7 @@ async def approve_enrollment_request(request_id: str, user: Dict[str, Any] = Dep
     request_doc = await db.enrollment_requests.find_one({"id": request_id}, {"_id": 0})
     if not request_doc:
         raise HTTPException(status_code=404, detail="Request tidak ditemukan")
-    await require_class_access(request_doc.get("class_id", ""), user)
+    await require_class_mutation_access(request_doc.get("class_id", ""), user)
     await db.users.update_one({"id": request_doc["student_id"]}, {"$addToSet": {"class_ids": request_doc["class_id"]}})
     await db.classes.update_one({"id": request_doc["class_id"]}, {"$addToSet": {"student_ids": request_doc["student_id"]}})
     await db.enrollment_requests.update_one(
@@ -3890,7 +4097,7 @@ async def reject_enrollment_request(request_id: str, user: Dict[str, Any] = Depe
     request_doc = await db.enrollment_requests.find_one({"id": request_id}, {"_id": 0})
     if not request_doc:
         raise HTTPException(status_code=404, detail="Request tidak ditemukan")
-    await require_class_access(request_doc.get("class_id", ""), user)
+    await require_class_mutation_access(request_doc.get("class_id", ""), user)
     await db.enrollment_requests.update_one(
         {"id": request_id},
         {"$set": {"status": "rejected", "rejected_at": now_iso(), "rejected_by": user["id"]}},
@@ -4482,6 +4689,53 @@ async def list_courses(_: Dict[str, Any] = Depends(get_current_user)):
     return [await enrich_course_payload(item) for item in courses]
 
 
+@api_router.get("/courses/{course_id}/grade-weights")
+async def get_course_grade_weights(course_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    course = await require_course_access(course_id, user)
+    customized = isinstance(course.get("grade_weights"), dict)
+    return {
+        "course_id": course_id,
+        "course_name": course.get("name", ""),
+        "weights": grade_weights_from_document(course.get("grade_weights")),
+        "customized": customized,
+    }
+
+
+@api_router.put("/courses/{course_id}/grade-weights")
+async def update_course_grade_weights(
+    course_id: str,
+    payload: GradeWeightsInput,
+    user: Dict[str, Any] = Depends(require_admin),
+):
+    course = await require_course_access(course_id, user)
+    weights = validate_grade_weights(payload.model_dump())
+    await db.courses.update_one(
+        {"id": course_id},
+        {"$set": {"grade_weights": weights, "grade_weights_updated_at": now_iso(), "grade_weights_updated_by": user["id"]}},
+    )
+    return {
+        "course_id": course_id,
+        "course_name": course.get("name", ""),
+        "weights": weights,
+        "customized": True,
+    }
+
+
+@api_router.delete("/courses/{course_id}/grade-weights")
+async def reset_course_grade_weights(course_id: str, user: Dict[str, Any] = Depends(require_admin)):
+    course = await require_course_access(course_id, user)
+    await db.courses.update_one(
+        {"id": course_id},
+        {"$unset": {"grade_weights": "", "grade_weights_updated_at": "", "grade_weights_updated_by": ""}},
+    )
+    return {
+        "course_id": course_id,
+        "course_name": course.get("name", ""),
+        "weights": dict(DEFAULT_GRADE_WEIGHTS),
+        "customized": False,
+    }
+
+
 @api_router.post("/courses")
 async def create_course(payload: CourseInput, _: Dict[str, Any] = Depends(require_admin)):
     program_query = {"id": payload.program_id, "status": {"$ne": "deleted"}} if payload.program_id else {"status": {"$ne": "deleted"}}
@@ -4556,6 +4810,8 @@ async def create_class(payload: ClassInput, user: Dict[str, Any] = Depends(requi
             "lecturer_name": user.get("name", "Dosen"),
             "status": "active",
             "student_ids": [],
+            "grade_weights_snapshot": grade_weights_from_document(course.get("grade_weights")),
+            "grade_weights_snapshot_customized": isinstance(course.get("grade_weights"), dict),
             "created_at": now_iso(),
         }
     )
@@ -4563,9 +4819,68 @@ async def create_class(payload: ClassInput, user: Dict[str, Any] = Depends(requi
     return await enrich_class_payload(public_doc(doc))
 
 
+@api_router.post("/classes/{class_id}/duplicate")
+async def duplicate_class_for_new_period(
+    class_id: str,
+    payload: ClassDuplicateInput,
+    user: Dict[str, Any] = Depends(require_admin),
+):
+    if payload.confirmation.strip().upper() != "DUPLIKASI":
+        raise HTTPException(status_code=400, detail="Ketik DUPLIKASI untuk membuat kelas periode baru.")
+    source = await require_class_access(class_id, user)
+    academic_year = payload.academic_year.strip()
+    semester = payload.semester.strip()
+    name = payload.name.strip()
+    if academic_year == str(source.get("academic_year", "")).strip() and semester.lower() == str(source.get("semester", "")).strip().lower():
+        raise HTTPException(status_code=409, detail="Periode kelas baru harus berbeda dari kelas sumber.")
+    duplicate = await db.classes.find_one(
+        {
+            "course_id": source.get("course_id", ""),
+            "lecturer_id": source.get("lecturer_id", ""),
+            "academic_year": academic_year,
+            "semester": semester,
+            "name": name,
+            "status": {"$ne": CLASS_STATUS_DELETED},
+        },
+        {"_id": 0, "id": 1},
+    )
+    if duplicate:
+        raise HTTPException(status_code=409, detail="Kelas dengan mata kuliah, nama, dan periode tersebut sudah ada.")
+    course = await db.courses.find_one(
+        {"id": source.get("course_id", ""), "status": {"$ne": "deleted"}},
+        {"_id": 0},
+    )
+    if not course:
+        raise HTTPException(status_code=409, detail="Mata kuliah sumber sudah tidak tersedia.")
+    code_seed = f"{course.get('code', 'KLS')}{name}{uuid.uuid4().hex[:4]}"
+    doc = {
+        "id": new_id(),
+        "academic_year": academic_year,
+        "semester": semester,
+        "course_id": course["id"],
+        "course_name": course.get("name", source.get("course_name", "")),
+        "program_id": course.get("program_id", source.get("program_id", "")),
+        "program_name": course.get("program_name", source.get("program_name", "")),
+        "name": name,
+        "schedule": payload.schedule.strip(),
+        "class_code": clean_code(code_seed),
+        "lecturer_id": source.get("lecturer_id", user["id"]),
+        "lecturer_name": source.get("lecturer_name", user.get("name", "Dosen")),
+        "status": CLASS_STATUS_ACTIVE,
+        "student_ids": [],
+        "grade_weights_snapshot": grade_weights_from_document(course.get("grade_weights")),
+        "grade_weights_snapshot_customized": isinstance(course.get("grade_weights"), dict),
+        "duplicated_from_class_id": source["id"],
+        "duplicated_by": user["id"],
+        "created_at": now_iso(),
+    }
+    await db.classes.insert_one(doc)
+    return await enrich_class_payload(public_doc(doc))
+
+
 @api_router.put("/classes/{class_id}")
 async def update_class(class_id: str, payload: ClassInput, user: Dict[str, Any] = Depends(require_admin)):
-    existing = await require_class_access(class_id, user)
+    existing = await require_class_mutation_access(class_id, user)
     course = await db.courses.find_one({"id": payload.course_id, "status": {"$ne": "deleted"}}, {"_id": 0})
     if not course:
         raise HTTPException(status_code=404, detail="Mata kuliah tidak ditemukan")
@@ -4585,7 +4900,9 @@ async def update_class(class_id: str, payload: ClassInput, user: Dict[str, Any] 
 
 @api_router.delete("/classes/{class_id}")
 async def delete_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    await require_class_access(class_id, user)
+    class_doc = await require_class_access(class_id, user)
+    if not class_allows_learning(class_doc):
+        raise HTTPException(status_code=409, detail="Kelas yang sudah berakhir/final tidak dapat dihapus. Gunakan arsip untuk menyimpan histori.")
     result = await db.classes.update_one({"id": class_id}, {"$set": {"status": "deleted", "deleted_at": now_iso()}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
@@ -4595,16 +4912,89 @@ async def delete_class(class_id: str, user: Dict[str, Any] = Depends(require_adm
 
 @api_router.post("/classes/{class_id}/archive")
 async def archive_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    await require_class_access(class_id, user)
-    await db.classes.update_one({"id": class_id}, {"$set": {"status": "archived", "archived_at": now_iso()}})
+    class_doc = await require_class_access(class_id, user)
+    if class_doc.get("status") != CLASS_STATUS_FINALIZED:
+        raise HTTPException(status_code=409, detail="Finalisasi nilai terlebih dahulu sebelum mengarsipkan kelas.")
+    await db.classes.update_one(
+        {"id": class_id},
+        {"$set": {"status": CLASS_STATUS_ARCHIVED, "archived_at": now_iso()}},
+    )
     return {"ok": True}
 
 
 @api_router.post("/classes/{class_id}/end")
 async def end_class(class_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    await require_class_access(class_id, user)
-    await db.classes.update_one({"id": class_id}, {"$set": {"status": "ended", "ended_at": now_iso()}})
+    class_doc = await require_class_access(class_id, user)
+    if class_doc.get("status") != CLASS_STATUS_ACTIVE:
+        raise HTTPException(status_code=409, detail=f"Kelas tidak dapat diakhiri karena statusnya {class_status_label(class_doc.get('status', ''))}.")
+    course = await db.courses.find_one({"id": class_doc.get("course_id")}, {"_id": 0}) or {}
+    await db.classes.update_one(
+        {"id": class_id},
+        {
+            "$set": {
+                "status": CLASS_STATUS_ENDED,
+                "ended_at": now_iso(),
+                "grade_weights_snapshot": grade_weights_from_document(course.get("grade_weights")),
+                "grade_weights_snapshot_customized": isinstance(course.get("grade_weights"), dict),
+            }
+        },
+    )
     return {"ok": True}
+
+
+@api_router.post("/classes/{class_id}/finalize")
+async def finalize_class(
+    class_id: str,
+    payload: FinalizationInput,
+    user: Dict[str, Any] = Depends(require_admin),
+):
+    if payload.confirmation.strip().upper() != "FINALISASI":
+        raise HTTPException(status_code=400, detail="Ketik FINALISASI untuk mengunci nilai kelas.")
+    class_doc = await require_class_access(class_id, user)
+    if class_doc.get("status") != CLASS_STATUS_ENDED:
+        raise HTTPException(status_code=409, detail="Kelas harus berstatus Berakhir sebelum nilai difinalisasi.")
+    recaps = await build_grade_recap(user, class_id, use_snapshots=False)
+    recap = recaps[0] if recaps else None
+    incomplete = [
+        f"{student.get('student_name', 'Mahasiswa')} ({student.get('student_nim', '-')})"
+        for student in (recap or {}).get("students", [])
+        if not student.get("grade_complete")
+    ]
+    if incomplete:
+        raise HTTPException(
+            status_code=409,
+            detail="Nilai belum lengkap untuk: " + ", ".join(incomplete[:10]),
+        )
+    finalized_at = now_iso()
+    snapshot = recap or {
+        "class_id": class_id,
+        "class_name": class_doc.get("name", ""),
+        "students": [],
+        "student_count": 0,
+        "total_assignments": 0,
+        "class_average": 0,
+        "grade_distribution": {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0},
+        "grade_weights": grade_weights_from_document(class_doc.get("grade_weights_snapshot")),
+        "grade_weights_customized": bool(class_doc.get("grade_weights_snapshot_customized", False)),
+        "assignments": [],
+    }
+    snapshot["finalized_at"] = finalized_at
+    snapshot["finalized_by"] = user["id"]
+    snapshot["class_status"] = CLASS_STATUS_FINALIZED
+    snapshot["class_status_label"] = class_status_label(CLASS_STATUS_FINALIZED)
+    await db.classes.update_one(
+        {"id": class_id},
+        {
+            "$set": {
+                "status": CLASS_STATUS_FINALIZED,
+                "finalized_at": finalized_at,
+                "finalized_by": user["id"],
+                "final_grade_snapshot": snapshot,
+                "grade_weights_snapshot": snapshot.get("grade_weights", DEFAULT_GRADE_WEIGHTS),
+            }
+        },
+    )
+    return {"ok": True, "status": CLASS_STATUS_FINALIZED, "snapshot": snapshot}
 
 
 @api_router.get("/classes/{class_id}/students")
@@ -4621,7 +5011,7 @@ async def class_students(class_id: str, user: Dict[str, Any] = Depends(require_a
 
 @api_router.post("/classes/{class_id}/students/{student_id}/remove")
 async def remove_student_from_class(class_id: str, student_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    await require_class_access(class_id, user)
+    await require_class_mutation_access(class_id, user)
     await db.classes.update_one({"id": class_id}, {"$pull": {"student_ids": student_id}})
     await db.users.update_one({"id": student_id}, {"$pull": {"class_ids": class_id}})
     return {"ok": True}
@@ -4629,7 +5019,7 @@ async def remove_student_from_class(class_id: str, student_id: str, user: Dict[s
 
 @api_router.post("/classes/{class_id}/students/{student_id}/add")
 async def add_existing_student_to_class(class_id: str, student_id: str, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await get_manageable_class(class_id, user=user)
+    class_doc = await get_manageable_class(class_id, active_only=True, user=user)
     student = await get_active_student(student_id)
     result = await add_student_to_class_record(class_doc, student, user["id"])
     return {"ok": True, **result}
@@ -4640,7 +5030,7 @@ async def bulk_add_existing_students_to_class(class_id: str, payload: StudentIds
     student_ids = unique_ids(payload.student_ids)
     if not student_ids:
         raise HTTPException(status_code=400, detail="Pilih minimal satu mahasiswa")
-    class_doc = await get_manageable_class(class_id, user=user)
+    class_doc = await get_manageable_class(class_id, active_only=True, user=user)
     results = []
     for student_id in student_ids:
         try:
@@ -4761,7 +5151,7 @@ async def list_students(user: Dict[str, Any] = Depends(require_admin)):
 
 @api_router.post("/students")
 async def create_student(payload: StudentInput, user: Dict[str, Any] = Depends(require_campus_admin)):
-    class_doc = await require_class_access(payload.class_id, user)
+    class_doc = await require_class_mutation_access(payload.class_id, user)
     existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
     if existing:
         raise HTTPException(status_code=409, detail="Email mahasiswa sudah digunakan")
@@ -4795,7 +5185,7 @@ async def import_students(
     default_password: str = Form(""),
     user: Dict[str, Any] = Depends(require_campus_admin),
 ):
-    class_doc = await require_class_access(class_id, user)
+    class_doc = await require_class_mutation_access(class_id, user)
     content = await file.read()
     workbook = load_workbook(io.BytesIO(content))
     sheet = workbook.active
@@ -4881,7 +5271,7 @@ async def list_materials(user: Dict[str, Any] = Depends(get_current_user)):
 
 @api_router.post("/materials")
 async def create_material(payload: MaterialInput, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await require_class_access(payload.class_id, user)
+    class_doc = await require_class_mutation_access(payload.class_id, user)
     async with _material_creation_lock:
         meeting_number = await db.materials.count_documents({"class_id": payload.class_id}) + 1
         doc = normalized_material_payload(payload)
@@ -4901,7 +5291,7 @@ async def create_material(payload: MaterialInput, user: Dict[str, Any] = Depends
 
 @api_router.post("/materials/google-meet")
 async def generate_material_google_meet(payload: GoogleMeetInput, user: Dict[str, Any] = Depends(require_admin)):
-    await require_class_access(payload.class_id, user)
+    await require_class_mutation_access(payload.class_id, user)
     settings = await get_google_drive_settings(mask=False)
     if not settings.get("google_meet_enabled"):
         raise HTTPException(status_code=503, detail="Google Meet belum diaktifkan oleh Admin Kampus")
@@ -4918,8 +5308,8 @@ async def update_material(material_id: str, payload: MaterialInput, user: Dict[s
     existing = await db.materials.find_one({"id": material_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
-    await require_class_access(existing.get("class_id", ""), user)
-    class_doc = await require_class_access(payload.class_id, user)
+    await require_class_mutation_access(existing.get("class_id", ""), user)
+    class_doc = await require_class_mutation_access(payload.class_id, user)
     existing_attachment = existing.get("attachment") if isinstance(existing.get("attachment"), dict) else {}
     attachment_id = existing_attachment.get("file_id") or existing_attachment.get("id")
     attachment_url = local_file_urls(attachment_id)["file_url"] if attachment_id else ""
@@ -4954,7 +5344,7 @@ async def upload_material_attachment(
     material = await db.materials.find_one({"id": material_id}, {"_id": 0})
     if not material:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
-    await require_class_access(material.get("class_id", ""), user)
+    await require_class_mutation_access(material.get("class_id", ""), user)
     ext = attachment.filename.rsplit(".", 1)[-1].lower() if attachment.filename and "." in attachment.filename else ""
     allowed = {"pdf", "doc", "docx", "ppt", "pptx", "xls", "xlsx", "csv", "txt", "zip", "png", "jpg", "jpeg", "webp"}
     if ext not in allowed:
@@ -5008,7 +5398,7 @@ async def delete_material(material_id: str, user: Dict[str, Any] = Depends(requi
     if not existing:
         raise HTTPException(status_code=404, detail="Pertemuan tidak ditemukan")
     full_material = await db.materials.find_one({"id": material_id}, {"_id": 0, "class_id": 1}) or {}
-    await require_class_access(full_material.get("class_id", ""), user)
+    await require_class_mutation_access(full_material.get("class_id", ""), user)
     comments = await db.comments.find({"material_id": material_id}, {"_id": 0, "attachment.id": 1, "attachment.file_id": 1}).to_list(5000)
     attachment_ids = []
     for comment in comments:
@@ -5099,6 +5489,8 @@ async def list_comments(material_id: str, user: Dict[str, Any] = Depends(get_cur
 @api_router.post("/comments")
 async def create_comment(payload: CommentInput, user: Dict[str, Any] = Depends(get_current_user)):
     await discussion_material_for_user(payload.material_id, user)
+    material = await db.materials.find_one({"id": payload.material_id}, {"_id": 0, "class_id": 1}) or {}
+    await require_class_mutation_access(material.get("class_id", ""), user)
     await validate_comment_parent(payload.parent_id, payload.material_id)
     if not payload.content.strip():
         raise HTTPException(status_code=400, detail="Isi komentar diperlukan")
@@ -5129,6 +5521,7 @@ async def create_material_comment_with_image(
     user: Dict[str, Any] = Depends(get_current_user),
 ):
     material = await discussion_material_for_user(material_id, user)
+    await require_class_mutation_access(material.get("class_id", ""), user)
     await validate_comment_parent(parent_id, material_id)
     upload = attachment or image
     text = content.strip()
@@ -5180,6 +5573,8 @@ async def create_material_comment_with_image(
 async def pin_comment(comment_id: str, user: Dict[str, Any] = Depends(require_admin)):
     comment = await db.comments.find_one({"id": comment_id}, {"_id": 0, "material_id": 1}) or {}
     await discussion_material_for_user(comment.get("material_id", ""), user)
+    material = await db.materials.find_one({"id": comment.get("material_id", "")}, {"_id": 0, "class_id": 1}) or {}
+    await require_class_mutation_access(material.get("class_id", ""), user)
     await db.comments.update_one({"id": comment_id}, {"$set": {"is_pinned": True}})
     return {"ok": True}
 
@@ -5193,6 +5588,11 @@ async def list_assignments(background_tasks: BackgroundTasks, user: Dict[str, An
     elif user["role"] == "lecturer":
         query = {"class_id": {"$in": await lecturer_class_ids(user)}}
     assignments = await db.assignments.find(query, {"_id": 0}).sort("deadline", 1).to_list(1000)
+    class_ids = list({item.get("class_id", "") for item in assignments if item.get("class_id")})
+    class_docs = await db.classes.find({"id": {"$in": class_ids}}, {"_id": 0}).to_list(1000) if class_ids else []
+    classes_by_id = {item["id"]: item for item in class_docs}
+    for class_doc in classes_by_id.values():
+        class_doc["status_label"] = class_status_label(class_doc.get("status", ""))
     settings = await get_app_settings_cached()
     creator_ids = [item.get("created_by") for item in assignments if item.get("created_by")]
     creators = await db.users.find({"id": {"$in": creator_ids}}, {"_id": 0, "id": 1, "name": 1}).to_list(200) if creator_ids else []
@@ -5210,6 +5610,13 @@ async def list_assignments(background_tasks: BackgroundTasks, user: Dict[str, An
         for assignment in assignments:
             assignment["my_submission"] = subs_by_assignment.get(assignment["id"])
     for assignment in assignments:
+        class_doc = classes_by_id.get(assignment.get("class_id", ""), {})
+        assignment["class_status"] = class_doc.get("status", "")
+        assignment["class_status_label"] = class_doc.get("status_label", class_status_label(class_doc.get("status", "")))
+        assignment["class_read_only"] = class_is_read_only(class_doc)
+        assignment["class_allows_learning"] = class_allows_learning(class_doc)
+        assignment["class_allows_grading"] = class_allows_grading(class_doc)
+        assignment["assessment_category"] = normalize_assessment_category(assignment.get("assessment_category", "tugas"))
         assignment["publish_status"] = assignment_publish_status(assignment)
         assignment["max_file_size_mb"] = assignment_max_file_size_mb(assignment)
         assignment["max_submission_size_mb"] = assignment["max_file_size_mb"]
@@ -5224,8 +5631,9 @@ async def list_assignments(background_tasks: BackgroundTasks, user: Dict[str, An
 
 @api_router.post("/assignments")
 async def create_assignment(payload: AssignmentInput, background_tasks: BackgroundTasks, user: Dict[str, Any] = Depends(require_admin)):
-    class_doc = await require_class_access(payload.class_id, user)
+    class_doc = await require_class_mutation_access(payload.class_id, user)
     doc = payload.model_dump()
+    doc["assessment_category"] = normalize_assessment_category(doc.get("assessment_category"))
     doc["attachment_link"] = str(doc.get("attachment_link") or "").strip()
     doc["max_file_size_mb"] = assignment_max_file_size_mb(doc)
     doc["deadline"] = normalize_optional_datetime(doc.get("deadline", ""), "Deadline")
@@ -5274,9 +5682,10 @@ async def update_assignment(
     existing = await db.assignments.find_one({"id": assignment_id}, {"_id": 0})
     if not existing:
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
-    await require_class_access(existing.get("class_id", ""), user)
-    class_doc = await require_class_access(payload.class_id, user)
+    await require_class_mutation_access(existing.get("class_id", ""), user)
+    class_doc = await require_class_mutation_access(payload.class_id, user)
     doc = payload.model_dump()
+    doc["assessment_category"] = normalize_assessment_category(doc.get("assessment_category"))
     doc["attachment_link"] = str(doc.get("attachment_link") or "").strip()
     doc["max_file_size_mb"] = assignment_max_file_size_mb(doc)
     doc["deadline"] = normalize_optional_datetime(doc.get("deadline", ""), "Deadline")
@@ -5336,7 +5745,7 @@ async def upload_assignment_attachments(
     assignment = await db.assignments.find_one({"id": assignment_id}, {"_id": 0})
     if not assignment:
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
-    await require_class_access(assignment.get("class_id", ""), user)
+    await require_class_mutation_access(assignment.get("class_id", ""), user)
     _, files = await multipart_uploads(request, ["files", "file", "files[]"])
     if not files:
         raise HTTPException(status_code=400, detail="Minimal satu lampiran soal harus diunggah")
@@ -5651,6 +6060,9 @@ async def submit_assignment(
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
     if assignment["class_id"] not in user.get("class_ids", []):
         raise HTTPException(status_code=403, detail="Mahasiswa tidak terdaftar pada kelas tugas ini")
+    class_doc = await db.classes.find_one({"id": assignment["class_id"]}, {"_id": 0}) or {}
+    if not class_allows_learning(class_doc):
+        raise HTTPException(status_code=409, detail="Kelas sudah berakhir. Submission baru tidak dapat dikirim.")
     if not assignment_is_published(assignment):
         raise HTTPException(status_code=403, detail="Tugas belum tayang")
     submission = await db.submissions.find_one({"assignment_id": assignment_id, "student_id": user["id"]}, {"_id": 0})
@@ -5680,7 +6092,6 @@ async def submit_assignment(
     late_hours = round(late_delta.total_seconds() / 3600, 2) if late_delta.total_seconds() > 0 else 0
     late_days = late_delta.days if late_delta.total_seconds() > 0 else 0
     status = "Terlambat" if late_hours > 0 else "Sudah Submit"
-    class_doc = await db.classes.find_one({"id": assignment["class_id"]}, {"_id": 0}) or {}
     hierarchy = [
         class_doc.get("academic_year", "Tahun Akademik"),
         class_doc.get("semester", "Semester"),
@@ -6107,7 +6518,7 @@ async def get_grade_predicates(class_id: str = "", user: Dict[str, Any] = Depend
 @api_router.put("/grade-predicates")
 async def save_grade_predicates(payload: GradePredicateInput, user: Dict[str, Any] = Depends(require_admin)):
     if payload.class_id:
-        await require_class_access(payload.class_id, user)
+        await require_class_mutation_access(payload.class_id, user)
     elif user.get("role") == "lecturer":
         raise HTTPException(status_code=400, detail="Dosen harus memilih kelas untuk menyimpan predikat")
     predicates = validate_grade_predicates([item.model_dump() for item in payload.predicates])
@@ -6167,7 +6578,7 @@ async def send_reminder(payload: ReminderInput, user: Dict[str, Any] = Depends(r
     assignment = await db.assignments.find_one({"id": payload.assignment_id}, {"_id": 0})
     if not assignment:
         raise HTTPException(status_code=404, detail="Tugas tidak ditemukan")
-    class_doc = await require_class_access(assignment.get("class_id", ""), user)
+    class_doc = await require_class_mutation_access(assignment.get("class_id", ""), user)
     doc = payload.model_dump()
     doc.update({
         "id": new_id(),
@@ -6198,36 +6609,244 @@ async def list_reminders(user: Dict[str, Any] = Depends(get_current_user)):
     return reminders
 
 
+async def build_grade_recap(
+    user: Dict[str, Any],
+    class_id: Optional[str] = None,
+    use_snapshots: bool = True,
+) -> List[Dict[str, Any]]:
+    class_ids = await lecturer_class_ids(user)
+    if class_id and class_id not in class_ids:
+        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
+    scoped_ids = [class_id] if class_id else class_ids
+    classes = await db.classes.find({"id": {"$in": scoped_ids}}, {"_id": 0}).to_list(500)
+    if not classes:
+        return []
+    course_ids = list({item.get("course_id") for item in classes if item.get("course_id")})
+    courses = await db.courses.find({"id": {"$in": course_ids}}, {"_id": 0}).to_list(500)
+    courses_by_id = {item["id"]: item for item in courses}
+    assignments = await db.assignments.find({"class_id": {"$in": scoped_ids}, "is_active": True}, {"_id": 0}).to_list(5000)
+    assignments_by_class: Dict[str, List[Dict[str, Any]]] = {}
+    for item in assignments:
+        assignments_by_class.setdefault(item.get("class_id", ""), []).append(item)
+    submissions = await db.submissions.find({"class_id": {"$in": scoped_ids}, "grade": {"$ne": None}}, {"_id": 0}).to_list(10000)
+    submissions_by_class_student: Dict[tuple[str, str], List[Dict[str, Any]]] = {}
+    for item in submissions:
+        submissions_by_class_student.setdefault((item.get("class_id", ""), item.get("student_id", "")), []).append(item)
+
+    result: List[Dict[str, Any]] = []
+    for class_doc in classes:
+        cid = class_doc["id"]
+        course = courses_by_id.get(class_doc.get("course_id"), {})
+        if use_snapshots and class_doc.get("status") in CLASS_STATUSES_READ_ONLY and class_doc.get("final_grade_snapshot"):
+            result.append(class_doc["final_grade_snapshot"])
+            continue
+        snapshot_weights = class_doc.get("grade_weights_snapshot") if class_doc.get("status") != CLASS_STATUS_ACTIVE else None
+        weights = grade_weights_from_document(snapshot_weights or course.get("grade_weights"))
+        enrolled_ids = list(dict.fromkeys(class_doc.get("student_ids", [])))
+        students = await db.users.find(
+            {"id": {"$in": enrolled_ids}, "role": "student"},
+            {"_id": 0, "password_hash": 0},
+        ).to_list(max(1000, len(enrolled_ids) * 2 or 1))
+        student_map = {item["id"]: item for item in students}
+        student_ids = list(dict.fromkeys(enrolled_ids + list(student_map.keys())))
+        class_assignments = assignments_by_class.get(cid, [])
+        class_students: List[Dict[str, Any]] = []
+        scored_totals: List[float] = []
+        for sid in student_ids:
+            student = student_map.get(sid, {})
+            student_submissions = submissions_by_class_student.get((cid, sid), [])
+            component_values: Dict[str, List[float]] = {component: [] for component in GRADE_WEIGHT_COMPONENTS}
+            scores = []
+            for submission in student_submissions:
+                assignment = next((item for item in class_assignments if item.get("id") == submission.get("assignment_id")), {})
+                component = normalize_assessment_category(assignment.get("assessment_category", "tugas"))
+                score = float(submission.get("grade", 0))
+                component_values[component].append(score)
+                scores.append({
+                    "assignment_id": submission.get("assignment_id", ""),
+                    "assignment_title": submission.get("assignment_title", assignment.get("title", "")),
+                    "assessment_category": component,
+                    "grade": score,
+                    "grade_predicate": submission.get("grade_predicate", ""),
+                })
+            component_scores = {
+                component: round(sum(values) / len(values), 2) if values else None
+                for component, values in component_values.items()
+            }
+            available_components = [
+                component for component in GRADE_WEIGHT_COMPONENTS if component_scores[component] is not None and weights[component] > 0
+            ]
+            available_weight = sum(weights[component] for component in available_components)
+            weighted_grade = round(
+                sum(component_scores[component] * weights[component] for component in available_components) / available_weight,
+                2,
+            ) if available_weight else 0
+            if scores:
+                scored_totals.append(weighted_grade)
+            class_students.append({
+                "student_id": sid,
+                "student_name": student.get("name", "Mahasiswa"),
+                "student_nim": student.get("nim", ""),
+                "scores": sorted(scores, key=lambda item: item.get("assignment_title", "")),
+                "component_scores": component_scores,
+                "weighted_grade": weighted_grade,
+                "average": weighted_grade,
+                "total_graded": len(scores),
+                "grade_complete": len(available_components) == len(GRADE_WEIGHT_COMPONENTS),
+                "grade_predicate": await calculate_grade_predicate(weighted_grade, cid) if scores else "-",
+            })
+        distribution = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0}
+        for score in scored_totals:
+            if score >= 85:
+                distribution["A"] += 1
+            elif score >= 70:
+                distribution["B"] += 1
+            elif score >= 60:
+                distribution["C"] += 1
+            elif score >= 50:
+                distribution["D"] += 1
+            else:
+                distribution["E"] += 1
+        result.append({
+            "class_id": cid,
+            "course_id": class_doc.get("course_id", ""),
+            "course_name": course.get("name") or class_doc.get("course_name", ""),
+            "class_name": class_doc.get("name", ""),
+            "class_status": class_doc.get("status", CLASS_STATUS_ACTIVE),
+            "class_status_label": class_status_label(class_doc.get("status", CLASS_STATUS_ACTIVE)),
+            "ended_at": class_doc.get("ended_at", ""),
+            "finalized_at": class_doc.get("finalized_at", ""),
+            "student_count": len(class_students),
+            "total_assignments": len(class_assignments),
+            "class_average": round(sum(scored_totals) / len(scored_totals), 2) if scored_totals else 0,
+            "grade_distribution": distribution,
+            "grade_weights": weights,
+            "grade_weights_customized": (
+                bool(class_doc.get("grade_weights_snapshot_customized", False))
+                if snapshot_weights
+                else isinstance(course.get("grade_weights"), dict)
+            ),
+            "assignments": [
+                {
+                    "id": item.get("id", ""),
+                    "title": item.get("title", "Tugas"),
+                    "assessment_category": normalize_assessment_category(item.get("assessment_category", "tugas")),
+                }
+                for item in class_assignments
+            ],
+            "students": sorted(class_students, key=lambda item: (item.get("student_name", ""), item.get("student_nim", ""))),
+        })
+    return sorted(result, key=lambda item: (item.get("course_name", ""), item.get("class_name", "")))
+
+
 @api_router.get("/reports/grades.xlsx")
-async def export_grades(user: Dict[str, Any] = Depends(require_admin)):
-    submissions = await db.submissions.find(
-        {"class_id": {"$in": await lecturer_class_ids(user)}}, {"_id": 0}
-    ).sort("student_name", 1).to_list(5000)
+async def export_grades(class_id: Optional[str] = None, user: Dict[str, Any] = Depends(require_admin)):
+    recaps = await build_grade_recap(user, class_id)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Rekap Nilai"
-    sheet.append(["NIM", "Nama", "Tugas", "Status", "Nilai", "Predikat", "Feedback", "Waktu Submit"])
-    for item in submissions:
-        sheet.append(
-            [
-                item.get("student_nim", ""),
-                item.get("student_name", ""),
-                item.get("assignment_title", ""),
-                item.get("status", ""),
-                item.get("grade", ""),
-                item.get("grade_predicate", ""),
-                item.get("feedback", ""),
-                item.get("submitted_at", ""),
-            ]
-        )
+    sheet.append(["NIM", "Nama", "Mata Kuliah", "Kelas", "Nilai Akhir", "Predikat", "Status", "Nilai Tugas", "Nilai UTS", "Nilai UAS", "Bobot Tugas", "Bobot UTS", "Bobot UAS"])
+    for recap in recaps:
+        weights = recap.get("grade_weights", DEFAULT_GRADE_WEIGHTS)
+        for student in recap.get("students", []):
+            components = student.get("component_scores", {})
+            sheet.append([
+                student.get("student_nim", ""),
+                student.get("student_name", ""),
+                recap.get("course_name", ""),
+                recap.get("class_name", ""),
+                student.get("weighted_grade", 0),
+                student.get("grade_predicate", "-"),
+                "Lengkap" if student.get("grade_complete") else "Sementara",
+                components.get("tugas", ""),
+                components.get("uts", ""),
+                components.get("uas", ""),
+                weights.get("tugas", 25),
+                weights.get("uts", 35),
+                weights.get("uas", 40),
+            ])
+    for column in sheet.columns:
+        column_letter = column[0].column_letter
+        sheet.column_dimensions[column_letter].width = min(max(max(len(str(cell.value or "")) for cell in column) + 2, 12), 32)
     stream = io.BytesIO()
     workbook.save(stream)
     stream.seek(0)
-    headers = {"Content-Disposition": "attachment; filename=rekap-nilai.xlsx"}
+    filename = "rekap-nilai.xlsx" if not class_id else f"rekap-nilai-{class_id}.xlsx"
+    headers = {"Content-Disposition": f"attachment; filename={filename}"}
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers=headers,
+    )
+
+
+def _pdf_text(value: Any) -> str:
+    text = str(value or "").replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+    return text.encode("latin-1", "replace").decode("latin-1")
+
+
+def build_grade_recap_pdf(recaps: List[Dict[str, Any]]) -> bytes:
+    lines = ["REKAP NILAI MAHASISWA", ""]
+    for recap in recaps:
+        weights = recap.get("grade_weights", DEFAULT_GRADE_WEIGHTS)
+        lines.extend([
+            f"Mata Kuliah: {recap.get('course_name', '')} | Kelas: {recap.get('class_name', '')}",
+            f"Bobot: Tugas {weights.get('tugas', 25)}% | UTS {weights.get('uts', 35)}% | UAS {weights.get('uas', 40)}%",
+            "NIM | Nama | Tugas | UTS | UAS | Nilai Akhir | Status | Predikat",
+        ])
+        for student in recap.get("students", []):
+            components = student.get("component_scores", {})
+            lines.append(
+                f"{student.get('student_nim', '')} | {student.get('student_name', '')} | "
+                f"{components.get('tugas', '-')} | {components.get('uts', '-')} | {components.get('uas', '-')} | "
+                f"{student.get('weighted_grade', 0)} | "
+                f"{'Lengkap' if student.get('grade_complete') else 'Sementara'} | {student.get('grade_predicate', '-') }"
+            )
+        lines.append("")
+    if not recaps:
+        lines.append("Belum ada data rekap nilai.")
+
+    chunks = [lines[index:index + 52] for index in range(0, len(lines), 52)] or [[]]
+    objects: List[bytes] = []
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    page_ids = [3 + index * 2 for index in range(len(chunks))]
+    content_ids = [page_id + 1 for page_id in page_ids]
+    kids = " ".join(f"{page_id} 0 R" for page_id in page_ids)
+    objects.append(f"<< /Type /Pages /Kids [{kids}] /Count {len(page_ids)} >>".encode("ascii"))
+    for page_id, content_id, page_lines in zip(page_ids, content_ids, chunks):
+        objects.append(f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 {3 + len(chunks) * 2} 0 R >> >> /Contents {content_id} 0 R >>".encode("ascii"))
+        content_lines = ["BT", "/F1 8 Tf", "40 760 Td", "11 TL"]
+        for line in page_lines:
+            content_lines.append(f"({_pdf_text(line[:130])}) Tj")
+            content_lines.append("T*")
+        content_lines.append("ET")
+        content = "\n".join(content_lines).encode("latin-1", "replace")
+        objects.append(f"<< /Length {len(content)} >>\nstream\n".encode("ascii") + content + b"\nendstream")
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    output = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = [0]
+    for index, obj in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output.extend(f"{index} 0 obj\n".encode("ascii"))
+        output.extend(obj)
+        output.extend(b"\nendobj\n")
+    xref_offset = len(output)
+    output.extend(f"xref\n0 {len(objects) + 1}\n".encode("ascii"))
+    output.extend(b"0000000000 65535 f \n")
+    for offset in offsets[1:]:
+        output.extend(f"{offset:010d} 00000 n \n".encode("ascii"))
+    output.extend(f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode("ascii"))
+    return bytes(output)
+
+
+@api_router.get("/reports/grades.pdf")
+async def export_grades_pdf(class_id: Optional[str] = None, user: Dict[str, Any] = Depends(require_admin)):
+    pdf = build_grade_recap_pdf(await build_grade_recap(user, class_id))
+    filename = "rekap-nilai.pdf" if not class_id else f"rekap-nilai-{class_id}.pdf"
+    return StreamingResponse(
+        io.BytesIO(pdf),
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
@@ -6250,77 +6869,7 @@ async def report_summary(user: Dict[str, Any] = Depends(require_admin)):
 
 @api_router.get("/reports/grade-recap")
 async def grade_recap(class_id: Optional[str] = None, user: Dict[str, Any] = Depends(require_admin)):
-    class_ids = await lecturer_class_ids(user)
-    if class_id and class_id not in class_ids:
-        raise HTTPException(status_code=404, detail="Kelas tidak ditemukan")
-    query = {"class_id": class_id} if class_id else {"class_id": {"$in": class_ids}}
-    submissions = await db.submissions.find({**query, "grade": {"$ne": None}}, {"_id": 0}).to_list(5000)
-    classes = await db.classes.find({"id": {"$in": class_ids}}, {"_id": 0}).to_list(500)
-    class_map = {c["id"]: c for c in classes}
-
-    class_groups: Dict[str, Any] = {}
-    for s in submissions:
-        cid = s.get("class_id", "unknown")
-        if cid not in class_groups:
-            entry = class_map.get(cid, {})
-            class_groups[cid] = {
-                "class_id": cid,
-                "course_name": s.get("course_name") or entry.get("course_name", ""),
-                "class_name": s.get("class_name") or entry.get("name", ""),
-                "course_id": s.get("course_id") or entry.get("course_id", ""),
-                "students": {},
-                "assignment_ids": set(),
-            }
-        g = class_groups[cid]
-        sid = s["student_id"]
-        if sid not in g["students"]:
-            g["students"][sid] = {
-                "student_id": sid,
-                "student_name": s["student_name"],
-                "student_nim": s.get("student_nim", ""),
-                "scores": [],
-            }
-        g["students"][sid]["scores"].append({
-            "assignment_id": s["assignment_id"],
-            "assignment_title": s.get("assignment_title", ""),
-            "grade": s["grade"],
-            "grade_predicate": s.get("grade_predicate", ""),
-        })
-        g["assignment_ids"].add(s["assignment_id"])
-
-    result = []
-    for cid, g in class_groups.items():
-        students_list = list(g["students"].values())
-        all_scores = []
-        for student in students_list:
-            scores_list = [sc["grade"] for sc in student["scores"]]
-            student["average"] = round(sum(scores_list) / len(scores_list), 1) if scores_list else 0
-            student["total_graded"] = len(student["scores"])
-            all_scores.extend(scores_list)
-
-        class_avg = round(sum(all_scores) / len(all_scores), 1) if all_scores else 0
-
-        dist = {"A": 0, "B": 0, "C": 0, "D": 0, "E": 0}
-        for score in all_scores:
-            if score >= 85: dist["A"] += 1
-            elif score >= 70: dist["B"] += 1
-            elif score >= 60: dist["C"] += 1
-            elif score >= 50: dist["D"] += 1
-            else: dist["E"] += 1
-
-        result.append({
-            "class_id": cid,
-            "course_name": g["course_name"],
-            "class_name": g["class_name"],
-            "course_id": g["course_id"],
-            "student_count": len(students_list),
-            "total_assignments": len(g["assignment_ids"]),
-            "class_average": class_avg,
-            "grade_distribution": dist,
-            "students": sorted(students_list, key=lambda x: x["student_name"]),
-        })
-
-    return sorted(result, key=lambda x: (x["course_name"], x["class_name"]))
+    return await build_grade_recap(user, class_id)
 
 
 @api_router.get("/settings")
@@ -6413,6 +6962,7 @@ async def on_startup():
     await load_oidc_runtime_settings()
     await ensure_program_course_links()
     await ensure_multi_lecturer_schema()
+    await ensure_class_lifecycle_schema()
     await db.users.update_one({"email": "dosen@demo.id", "username": {"$exists": False}}, {"$set": {"username": "dosenadmin", "whatsapp": "628000000001"}})
     async for student in db.users.find({"role": "student", "username": {"$exists": False}}, {"_id": 0, "id": 1, "nim": 1}):
         if student.get("nim"):
