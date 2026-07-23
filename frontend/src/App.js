@@ -82,7 +82,18 @@ import {
   Cell,
 } from "recharts";
 
-const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
+function resolveBackendUrl() {
+  const configuredUrl = String(
+    process.env.REACT_APP_BACKEND_URL || ""
+  ).trim().replace(/\/+$/, "");
+  if (configuredUrl) return configuredUrl;
+  if (typeof window !== "undefined" && window.location?.origin) {
+    return window.location.origin;
+  }
+  return "";
+}
+
+const BACKEND_URL = resolveBackendUrl();
 const API = `${BACKEND_URL}/api`;
 const DEFAULT_SUBMISSION_MAX_FILE_MB = 5;
 const DEFAULT_SUBMISSION_FORMATS = [
@@ -157,8 +168,8 @@ const defaultSsoForm = {
   issuer: "http://localhost:8081/realms/sci",
   client_id: "nugaslagi-local",
   client_secret: "",
-  redirect_uri: "http://127.0.0.1:8002/api/auth/sso/callback",
-  frontend_url: "http://127.0.0.1:3000",
+  redirect_uri: `${BACKEND_URL}/api/auth/sso/callback`,
+  frontend_url: BACKEND_URL,
   scopes: "openid profile email roles",
   local_login_enabled: true,
   clear_client_secret: false,

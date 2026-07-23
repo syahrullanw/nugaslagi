@@ -6,6 +6,16 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.0.9] — 2026-07-23
+
+### Hotfix deployment frontend
+
+- Menghapus URL backend lokal `127.0.0.1:8002` dari konfigurasi build produksi.
+- Menggunakan origin situs yang sedang dibuka sebagai alamat backend default, sehingga frontend dan endpoint `/api` tetap bekerja melalui domain serta reverse proxy yang sama.
+- Menyesuaikan callback dan URL frontend SSO agar mengikuti origin situs, tanpa menanam alamat komputer lokal ke dalam bundle produksi.
+- Menambahkan pemeriksaan GitHub Actions yang menggagalkan build jika URL backend lokal port `8002` kembali masuk ke aset JavaScript produksi.
+- Tidak ada perubahan skema atau data PostgreSQL pada rilis ini.
+
 ## [1.0.8] — 2026-07-23
 
 ### Lifecycle kelas dan akhir semester
