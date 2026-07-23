@@ -6,9 +6,92 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.0.8] — 2026-07-23
+
+### Lifecycle kelas dan akhir semester
+
+- Menetapkan status kelas berurutan `Aktif → Berakhir → Nilai difinalisasi → Arsip`, dengan aturan server yang menutup perubahan materi, tugas, anggota, submission, diskusi, dan konfigurasi kelas setelah kelas diakhiri.
+- Mempertahankan ruang penilaian pada status `Berakhir` agar dosen dapat menyelesaikan koreksi sebelum finalisasi; kelas `Nilai difinalisasi` dan `Arsip` sepenuhnya read-only.
+- Menambahkan finalisasi nilai eksplisit dengan konfirmasi `FINALISASI`, pemeriksaan kelengkapan komponen Tugas/UTS/UAS, snapshot rekap akhir, identitas pemroses, dan waktu finalisasi.
+- Menyimpan snapshot bobot nilai saat kelas diakhiri sehingga perubahan bobot mata kuliah pada semester berikutnya tidak mengubah histori nilai semester lama.
+- Menambahkan backfill startup yang idempotent untuk snapshot bobot kelas lama berstatus berakhir/final/arsip; tidak ada perubahan versi skema SQL karena field tersimpan dalam dokumen JSONB.
+- Menambahkan aksi `Periode baru` dengan konfirmasi `DUPLIKASI` untuk membuat kelas aktif baru berkode baru, tanpa menyalin mahasiswa, materi, tugas, atau submission dari kelas sumber.
+
+### Approval, konfirmasi, dan panduan pengguna
+
+- Menutup bypass endpoint registrasi lama: akun mahasiswa tidak lagi langsung masuk kelas dan selalu membuat permintaan enrollment `pending` yang harus disetujui dosen/admin.
+- Menambahkan verifikasi password pada akun lama sebelum endpoint kompatibilitas membuat permintaan kelas.
+- Menambahkan konfirmasi pada tindakan penting: membuat/mengubah kelas, publikasi materi, pembuatan tugas, import mahasiswa, approval/reject enrollment, perubahan anggota, bobot/predikat nilai, penilaian, revisi, pengumpulan tugas, penutupan kelas, finalisasi, arsip, dan perubahan periode akademik.
+- Menambahkan menu `Panduan LMS` khusus admin, dosen, dan mahasiswa yang menjelaskan alur setup, permintaan masuk kelas, approval, pembelajaran, penilaian, finalisasi, arsip, dan pergantian semester.
+- Menambahkan `PANDUAN_LMS.md` sebagai referensi onboarding, checklist finalisasi, dan verifikasi upgrade server.
+- Menampilkan status lifecycle dan pesan read-only pada halaman kelas, materi, tugas, penilaian, rekap, diskusi, dan ruang mahasiswa agar pengguna memahami alasan sebuah aksi ditutup.
+
 ### Continuous integration
 
 - Memperbarui GitHub Actions ke runtime Node 24 dan menyesuaikan instalasi frontend agar peer dependency proyek dapat dipasang secara konsisten di CI.
+
+## [1.0.7] — 2026-07-23
+
+### Dashboard informatif untuk semua pengguna
+
+- Menata ulang dashboard superadmin dan dosen menjadi pusat kendali berbasis peran dengan sapaan, progres penilaian, status penyimpanan, metrik kelas, dan shortcut tindakan utama.
+- Menambahkan prioritas operasional untuk submission belum dinilai, tugas belum dikumpulkan, permintaan masuk kelas, serta mahasiswa yang membutuhkan perhatian.
+- Menambahkan grafik aktivitas submission tujuh hari, agenda deadline dengan countdown dan reminder, tabel progres mahasiswa, serta feed submission dan diskusi terbaru.
+- Memastikan seluruh data dashboard dosen tetap mengikuti batas kelas yang dikelola, sementara superadmin mendapat ringkasan kampus dan jumlah dosen aktif.
+- Memperkaya dashboard mahasiswa dengan persentase penyelesaian tugas, deadline prioritas, progres per kelas, ringkasan aksi, agenda mendatang, serta nilai dan feedback terbaru.
+- Menyesuaikan dashboard baru untuk desktop, tablet, perangkat seluler, empty state, dan kebutuhan cetak.
+
+## [1.0.6] — 2026-07-23
+
+### Dashboard laporan analitik
+
+- Mengubah halaman Laporan menjadi dashboard analitik dengan filter kelas dan rentang tren 7, 14, atau 30 hari.
+- Menambahkan grafik tren submission harian, status submission, serta perbandingan rata-rata nilai dan ketuntasan penilaian per kelas.
+- Menambahkan sorotan submission yang belum dinilai, tingkat keterlambatan, dan kelas dengan performa terbaik untuk mempercepat tindak lanjut.
+- Menyesuaikan ringkasan mahasiswa, tugas, submission, dan progres penilaian dengan kelas yang dipilih.
+- Menambahkan export Excel/PDF dan cetak langsung dari halaman laporan; export mengikuti filter kelas aktif.
+- Menyediakan empty state, layout responsif untuk perangkat seluler, dan tampilan khusus cetak.
+
+## [1.0.5] — 2026-07-22
+
+### Bobot nilai dan rekap per mata kuliah
+
+- Menambahkan pengaturan bobot Tugas, UTS, dan UAS per mata kuliah untuk akun dosen dan superadmin, dengan default 25% · 35% · 40% serta validasi total wajib 100%.
+- Menambahkan penandaan komponen nilai pada tugas agar setiap tugas dapat masuk ke kelompok Tugas, UTS, atau UAS.
+- Mengubah rekap nilai menjadi nilai akhir berbobot per mahasiswa, menampilkan komposisi bobot, nilai komponen, status sementara/lengkap, dan distribusi grade.
+- Menambahkan export rekap per kelas/mata kuliah dalam format Excel dan PDF, serta tombol cetak dari detail rekap.
+
+## [1.0.4] — 2026-07-22
+
+### Tampilan ruang mahasiswa
+
+- Memprioritaskan tugas yang belum dikumpulkan atau diminta revisi pada beranda mahasiswa dan mengganti hitungan aktivitas dengan jumlah tindakan yang benar-benar perlu dikerjakan.
+- Mengurutkan daftar tugas berdasarkan kebutuhan tindakan dan deadline, serta membuka tugas pilihan langsung dari kartu prioritas di beranda.
+- Memperjelas pengumpulan tugas menjadi tiga langkah: pilih file, tambahkan catatan opsional, lalu kumpulkan.
+- Memperjelas status tugas yang sudah terkumpul dan alasan pengiriman ulang dikunci sampai dosen meminta revisi.
+- Menyesuaikan tata letak kartu prioritas, progres, status, dan formulir pengumpulan untuk desktop maupun perangkat seluler.
+
+## [1.0.3] — 2026-07-22
+
+### Konfigurasi akademik
+
+- Menata ulang halaman `Prodi, MK & Kelas` menjadi alur tiga langkah: program studi → mata kuliah → kelas semester.
+- Menambahkan ringkasan jumlah prodi, mata kuliah, dan kelas aktif serta navigasi lompat ke setiap langkah.
+- Menambahkan penjelasan prasyarat agar mata kuliah hanya dibuat setelah prodi tersedia dan kelas hanya dibuat setelah mata kuliah tersedia.
+- Menambahkan input SKS pada mata kuliah, placeholder konfigurasi kelas, dan keterangan bahwa kode kelas dibuat otomatis.
+- Memperjelas status kelas menjadi `Aktif` atau `Berakhir`, serta menampilkan tahun akademik dan semester di daftar kelas.
+- Menyesuaikan kartu, tabel, mode edit, empty state, dan layout mobile agar konfigurasi lebih mudah dipahami.
+
+## [1.0.2] — 2026-07-22
+
+### Penilaian
+
+- Menata ulang halaman Penilaian menjadi alur tiga langkah: pilih tugas/status, pilih mahasiswa, lalu nilai pada satu ruang kerja.
+- Menambahkan ringkasan progres kelas, antrean submission dengan prioritas submission yang belum dinilai, pencarian nama/NIM/tugas, dan filter status.
+- Memindahkan nilai massal ke panel yang dapat dibuka saat diperlukan agar tidak mengganggu alur penilaian satu submission.
+- Menampilkan konteks tugas, waktu kirim, status keterlambatan, catatan mahasiswa, lampiran, rubrik, feedback, dan catatan revisi secara berurutan.
+- Memperbaiki sinkronisasi nilai dan feedback saat berpindah submission serta memperbaiki judul kelas yang sebelumnya dapat tampil kosong.
+- Menyesuaikan layout desktop dan mobile untuk menjaga antrean, form nilai, tombol aksi, dan navigasi tetap mudah digunakan.
 
 ## [1.0.1] — 2026-07-22
 
