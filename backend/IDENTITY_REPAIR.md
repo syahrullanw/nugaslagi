@@ -1,12 +1,12 @@
 # Perbaikan Identitas Mahasiswa Duplikat
 
-Dokumen ini mendampingi rilis `v1.0.11`. Semua perintah perbaikan bersifat
+Dokumen ini mendampingi rilis `v1.0.12`. Semua perintah perbaikan bersifat
 **dry-run** secara default. Jangan menggunakan `--apply` sebelum backup
 PostgreSQL terverifikasi dan hasil dry-run sudah diperiksa.
 
 ## Urutan aman
 
-1. Deploy kode `v1.0.11`. Startup tidak lagi gagal ketika menemukan duplikat
+1. Deploy kode `v1.0.12`. Startup tidak lagi gagal ketika menemukan duplikat
    lama, tetapi mencatat error dan memasang indeks non-unique sementara.
 2. Pastikan `nugas-backend`, Nginx, dan PostgreSQL sehat.
 3. Jalankan dry-run untuk setiap perubahan identitas.
@@ -30,9 +30,10 @@ sudo -u www-data backend/.venv/bin/python \
   --target-user-id '<UUID akun h***>'
 ```
 
-Perintah akan menolak merge jika akun sumber memiliki submission, session,
-enrollment, chat, atau referensi lain di luar keanggotaan kelas. Jika dry-run
-aman, salin token yang dicetak dan jalankan:
+Perintah hanya mengizinkan pemindahan keanggotaan kelas serta reminder pasif
+bertipe `tugas_baru` dengan status `in_app`. Submission, session, enrollment,
+chat, reminder nilai/revisi, atau referensi lain tetap memblokir merge. Jika
+dry-run aman, salin token yang dicetak dan jalankan:
 
 ```bash
 sudo -u www-data backend/.venv/bin/python \
@@ -45,34 +46,51 @@ sudo -u www-data backend/.venv/bin/python \
 ```
 
 Akun sumber tidak dihapus. Statusnya menjadi `merged`, login dinonaktifkan,
-identitas lamanya disimpan pada `identity_archive`, dan keanggotaan kelas
-dipindahkan ke akun target.
+identitas lamanya disimpan pada `identity_archive`, sedangkan keanggotaan kelas
+dan reminder tugas baru pasif dipindahkan ke akun target.
 
 ## Rafiq Firmansyah dan Siti Rohmah
 
-Keputusan pemilik aplikasi: NIM `24010230` tetap milik Rafiq. NIM Siti harus
-dikonfirmasi dari sumber akademik sebelum koreksi dilakukan.
+Keputusan pemilik aplikasi:
 
-Setelah NIM Siti diketahui, jalankan dry-run:
+- Rafiq Firmansyah: NIM `24020130`.
+- Siti Rohmah: NIM `24010202`.
+
+Jalankan dry-run secara terpisah untuk kedua akun:
 
 ```bash
 sudo -u www-data backend/.venv/bin/python \
   backend/scripts/repair_duplicate_student_identities.py \
   set-nim \
+  --user-id '<UUID akun Rafiq>' \
+  --new-nim '24020130'
+
+sudo -u www-data backend/.venv/bin/python \
+  backend/scripts/repair_duplicate_student_identities.py \
+  set-nim \
   --user-id '<UUID akun Siti>' \
-  --new-nim '<NIM Siti yang benar>'
+  --new-nim '24010202'
 ```
 
-Lanjutkan hanya jika identitas dan token konfirmasi benar:
+Lanjutkan hanya jika nama akun, UUID, NIM baru, dan token konfirmasi pada
+masing-masing dry-run sudah benar:
 
 ```bash
 sudo -u www-data backend/.venv/bin/python \
   backend/scripts/repair_duplicate_student_identities.py \
   set-nim \
-  --user-id '<UUID akun Siti>' \
-  --new-nim '<NIM Siti yang benar>' \
+  --user-id '<UUID akun Rafiq>' \
+  --new-nim '24020130' \
   --apply \
-  --confirmation 'SET-NIM:<UUID akun Siti>:<NIM SITI>'
+  --confirmation 'SET-NIM:<UUID akun Rafiq>:24020130'
+
+sudo -u www-data backend/.venv/bin/python \
+  backend/scripts/repair_duplicate_student_identities.py \
+  set-nim \
+  --user-id '<UUID akun Siti>' \
+  --new-nim '24010202' \
+  --apply \
+  --confirmation 'SET-NIM:<UUID akun Siti>:24010202'
 ```
 
 Koreksi juga memperbarui salinan `student_nim` pada submission dan permintaan
