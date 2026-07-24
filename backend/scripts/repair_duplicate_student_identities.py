@@ -98,12 +98,24 @@ async def external_references(
 
 
 def safe_inactive_merge_reference(collection_name: str, document: Dict[str, Any], source_user_id: str) -> bool:
-    if collection_name != "classes":
+    if collection_name == "classes":
+        reference_field = "student_ids"
+        student_ids = document.get(reference_field, [])
+        expected_reference = isinstance(student_ids, list) and source_user_id in student_ids
+    elif collection_name == "reminder_logs":
+        reference_field = "student_id"
+        expected_reference = (
+            document.get(reference_field) == source_user_id
+            and document.get("reminder_type") == "tugas_baru"
+            and document.get("status") == "in_app"
+        )
+    else:
         return False
-    return source_user_id in document.get("student_ids", []) and not any(
+
+    return expected_reference and not any(
         contains_exact(value, source_user_id)
         for key, value in document.items()
-        if key != "student_ids"
+        if key != reference_field
     )
 
 
@@ -150,7 +162,8 @@ async def merge_inactive_duplicate(
             print(f"  - {collection_name}/{document_id}")
         if unsafe:
             raise RuntimeError(
-                "Merge otomatis ditolak karena akun sumber memiliki aktivitas di luar keanggotaan kelas: "
+                "Merge otomatis ditolak karena akun sumber memiliki aktivitas di luar "
+                "keanggotaan kelas atau reminder tugas baru pasif: "
                 + ", ".join(f"{name}/{document_id}" for name, document_id in unsafe)
             )
 
@@ -207,7 +220,10 @@ async def merge_inactive_duplicate(
             json.dumps(source, ensure_ascii=False),
             source_user_id,
         )
-        print("APPLIED: akun sumber diarsipkan dan keanggotaan kelas dipindahkan ke akun target.")
+        print(
+            "APPLIED: akun sumber diarsipkan, keanggotaan kelas dan reminder tugas baru pasif "
+            "dipindahkan ke akun target."
+        )
 
 
 async def set_student_nim(

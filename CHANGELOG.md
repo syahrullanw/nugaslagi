@@ -6,6 +6,17 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.0.12] — 2026-07-24
+
+### Penyelesaian repair identitas mahasiswa
+
+- Mengizinkan utility penggabungan akun tidak aktif memindahkan reminder pasif `tugas_baru` berstatus `in_app` ke akun yang dipertahankan.
+- Tetap memblokir merge apabila akun sumber memiliki submission, session, enrollment, chat, reminder nilai/revisi, atau referensi lain yang menunjukkan aktivitas pengguna.
+- Mendokumentasikan koreksi final: Rafiq Firmansyah menggunakan NIM `24020130` dan Siti Rohmah menggunakan NIM `24010202`.
+- Menambahkan test regresi untuk memastikan hanya keanggotaan kelas dan reminder tugas baru pasif yang dapat dipindahkan otomatis.
+- Menjalankan test integritas identitas dan kompilasi utility repair sebagai bagian dari verifikasi GitHub Actions.
+- Tidak ada migration SQL atau perubahan skema PostgreSQL pada rilis ini.
+
 ## [1.0.11] — 2026-07-24
 
 ### Integritas identitas mahasiswa

@@ -54,10 +54,21 @@ def test_exact_identity_replacement_deduplicates_membership_arrays_only():
     }
 
 
-def test_inactive_merge_accepts_only_class_membership_references():
+def test_inactive_merge_accepts_only_class_membership_and_passive_assignment_reminders():
     assert safe_inactive_merge_reference(
         "classes",
         {"id": "class-one", "student_ids": ["source"], "lecturer_id": "lecturer"},
+        "source",
+    )
+    assert safe_inactive_merge_reference(
+        "reminder_logs",
+        {
+            "id": "reminder-one",
+            "student_id": "source",
+            "assignment_id": "assignment-one",
+            "reminder_type": "tugas_baru",
+            "status": "in_app",
+        },
         "source",
     )
     assert not safe_inactive_merge_reference(
@@ -68,5 +79,41 @@ def test_inactive_merge_accepts_only_class_membership_references():
     assert not safe_inactive_merge_reference(
         "classes",
         {"id": "class-one", "student_ids": ["source"], "created_by": "source"},
+        "source",
+    )
+    assert not safe_inactive_merge_reference(
+        "classes",
+        {"id": "class-two", "student_ids": None},
+        "source",
+    )
+    assert not safe_inactive_merge_reference(
+        "reminder_logs",
+        {
+            "id": "reminder-two",
+            "student_id": "source",
+            "reminder_type": "nilai_tersedia",
+            "status": "in_app",
+        },
+        "source",
+    )
+    assert not safe_inactive_merge_reference(
+        "reminder_logs",
+        {
+            "id": "reminder-three",
+            "student_id": "source",
+            "reminder_type": "tugas_baru",
+            "status": "pending",
+        },
+        "source",
+    )
+    assert not safe_inactive_merge_reference(
+        "reminder_logs",
+        {
+            "id": "reminder-four",
+            "student_id": "source",
+            "created_by": "source",
+            "reminder_type": "tugas_baru",
+            "status": "in_app",
+        },
         "source",
     )
