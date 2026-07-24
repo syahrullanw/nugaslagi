@@ -6,6 +6,16 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.0.10] — 2026-07-24
+
+### Hotfix sinkronisasi Google Drive
+
+- Menambahkan dukungan `array_filters` pada adapter PostgreSQL untuk memperbarui referensi file yang tersimpan di dalam array submission dan lampiran tugas.
+- Menambahkan pencarian JSONB untuk dotted path yang melewati embedded array, seperti `files.file_id` dan `attachments.file_id`.
+- Mencegah proses Retry mengunggah ulang file yang sebenarnya sudah berhasil tersimpan di Google Drive tetapi sebelumnya gagal ketika memperbarui referensi internal.
+- Menambahkan test regresi untuk pencarian embedded array, filtered positional update `$[item]`, dan kontrak kompatibilitas `update_many()`.
+- Tidak ada migration atau perubahan skema PostgreSQL pada rilis ini.
+
 ## [1.0.9] — 2026-07-23
 
 ### Hotfix deployment frontend

@@ -1,6 +1,15 @@
 """Pure compatibility checks for the PostgreSQL document boundary."""
 
-from backend.postgres_database import _apply_update, _project, matches
+import inspect
+import json
+
+from backend.postgres_database import (
+    PostgresCollection,
+    _apply_update,
+    _project,
+    _QueryCompiler,
+    matches,
+)
 
 
 def test_query_semantics_cover_nested_fields_and_arrays():
@@ -17,6 +26,10 @@ def test_query_semantics_cover_nested_fields_and_arrays():
     assert matches(document, {"missing": {"$exists": False}})
     assert matches(document, {"$or": [{"status": "deleted"}, {"id": "one"}]})
     assert not matches(document, {"class_ids": {"$size": 1}})
+    assert matches(
+        {"files": [{"file_id": "file-one"}, {"file_id": "file-two"}]},
+        {"files.file_id": "file-two"},
+    )
 
 
 def test_update_semantics_cover_application_operators():
@@ -51,3 +64,43 @@ def test_projection_supports_inclusion_exclusion_and_nested_fields():
         "id": "one",
         "nested": {"a": 1, "b": 2},
     }
+
+
+def test_array_filters_replace_only_matching_embedded_file():
+    document = {
+        "id": "submission-one",
+        "files": [
+            {"file_id": "file-one", "drive_sync_status": "failed"},
+            {"file_id": "file-two", "drive_sync_status": "synced"},
+        ],
+    }
+    public_file = {
+        "file_id": "file-one",
+        "drive_sync_status": "synced",
+        "drive_file_url": "https://drive.google.com/file-one",
+    }
+
+    updated = _apply_update(
+        document,
+        {"$set": {"files.$[item]": public_file}},
+        array_filters=[{"item.file_id": "file-one"}],
+    )
+
+    assert updated["files"] == [
+        public_file,
+        {"file_id": "file-two", "drive_sync_status": "synced"},
+    ]
+    assert document["files"][0]["drive_sync_status"] == "failed"
+
+
+def test_array_query_compiles_jsonb_containment_for_embedded_documents():
+    compiler = _QueryCompiler()
+    sql = compiler.compile({"files.file_id": "file-one"})
+    parameters = [json.loads(value) for value in compiler.parameters]
+
+    assert "data @>" in sql
+    assert {"files": [{"file_id": "file-one"}]} in parameters
+
+
+def test_update_many_accepts_motor_array_filters_keyword():
+    assert "array_filters" in inspect.signature(PostgresCollection.update_many).parameters

@@ -80,6 +80,19 @@ def _nested_document(path: str, value: Any) -> Dict[str, Any]:
     return nested
 
 
+def _nested_containment_documents(path: str, value: Any) -> List[Dict[str, Any]]:
+    """Build JSONB containment candidates for object and embedded-array paths."""
+    parts = _path_parts(path)
+    candidates: List[Any] = [{parts[-1]: json_value(value)}]
+    for part in reversed(parts[:-1]):
+        nested: List[Any] = []
+        for candidate in candidates:
+            nested.append({part: candidate})
+            nested.append({part: [candidate]})
+        candidates = nested
+    return candidates
+
+
 def _get_path(document: Any, path: str, default: Any = _MISSING) -> Any:
     current = document
     for part in _path_parts(path):
@@ -87,6 +100,29 @@ def _get_path(document: Any, path: str, default: Any = _MISSING) -> Any:
             return default
         current = current[part]
     return current
+
+
+def _get_match_path(document: Any, path: str, default: Any = _MISSING) -> Any:
+    """Resolve dotted query paths through embedded arrays using Mongo-like semantics."""
+    parts = _path_parts(path)
+
+    def resolve(current: Any, index: int) -> Any:
+        if index >= len(parts):
+            return current
+        if isinstance(current, list):
+            values: List[Any] = []
+            for item in current:
+                value = resolve(item, index)
+                if value is _MISSING:
+                    continue
+                values.extend(value if isinstance(value, list) else [value])
+            return values if values else _MISSING
+        if not isinstance(current, dict) or parts[index] not in current:
+            return _MISSING
+        return resolve(current[parts[index]], index + 1)
+
+    value = resolve(document, 0)
+    return default if value is _MISSING else value
 
 
 def _set_path(document: Dict[str, Any], path: str, value: Any) -> None:
@@ -171,7 +207,7 @@ def matches(document: Dict[str, Any], query: Optional[Dict[str, Any]]) -> bool:
                 return False
         elif field.startswith("$"):
             raise ValueError(f"Operator query tidak didukung: {field}")
-        elif not _matches_field(_get_path(document, field), condition):
+        elif not _matches_field(_get_match_path(document, field), condition):
             return False
     return True
 
@@ -189,13 +225,17 @@ class _QueryCompiler:
         if field == "id" and isinstance(value, str):
             self.parameters.append(value)
             return f"(document_id = ${self.first_parameter + len(self.parameters) - 1}::text)"
-        parameter = self._parameter(value if isinstance(value, list) else _nested_document(field, value))
-        node_parameter = parameter if isinstance(value, list) else self._parameter(value)
-        if value is None:
-            return f"({node} IS NULL OR {node} = {node_parameter} OR data @> {parameter})"
         if isinstance(value, list):
+            parameter = self._parameter(value)
             return f"({node} = {parameter})"
-        return f"({node} = {node_parameter} OR data @> {parameter})"
+        node_parameter = self._parameter(value)
+        containment = " OR ".join(
+            f"data @> {self._parameter(candidate)}"
+            for candidate in _nested_containment_documents(field, value)
+        )
+        if value is None:
+            return f"({node} IS NULL OR {node} = {node_parameter} OR {containment})"
+        return f"({node} = {node_parameter} OR {containment})"
 
     def _field(self, field: str, condition: Any) -> str:
         node = _sql_node(field)
@@ -267,14 +307,77 @@ def _sort_value(document: Dict[str, Any], field: str) -> Tuple[int, int, Any]:
     return (1, 3, _json_dump(value))
 
 
-def _apply_update(document: Dict[str, Any], update: Dict[str, Any]) -> Dict[str, Any]:
+def _array_filter_queries(array_filters: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    queries: Dict[str, Dict[str, Any]] = {}
+    for definition in array_filters or []:
+        if not isinstance(definition, dict) or not definition:
+            raise ValueError("Array filter harus berupa object yang tidak kosong")
+        for path, condition in definition.items():
+            identifier, separator, nested_path = str(path).partition(".")
+            if (
+                not separator
+                or not nested_path
+                or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", identifier)
+            ):
+                raise ValueError(f"Array filter tidak didukung: {path!r}")
+            _path_parts(nested_path)
+            queries.setdefault(identifier, {})[nested_path] = condition
+    return queries
+
+
+def _set_filtered_path(
+    document: Dict[str, Any],
+    path: str,
+    value: Any,
+    filter_queries: Dict[str, Dict[str, Any]],
+) -> None:
+    parts = path.split(".")
+    filtered = [
+        (index, match.group(1))
+        for index, part in enumerate(parts)
+        if (match := re.fullmatch(r"\$\[([A-Za-z][A-Za-z0-9_]*)\]", part))
+    ]
+    if len(filtered) != 1:
+        raise ValueError(f"Path array filter tidak didukung: {path!r}")
+    index, identifier = filtered[0]
+    if identifier not in filter_queries:
+        raise ValueError(f"Array filter untuk {identifier!r} tidak ditemukan")
+    prefix = ".".join(parts[:index])
+    suffix = ".".join(parts[index + 1 :])
+    if not prefix:
+        raise ValueError(f"Path array filter tidak memiliki field induk: {path!r}")
+    current = _get_path(document, prefix, [])
+    if not isinstance(current, list):
+        return
+    updated = list(current)
+    for item_index, item in enumerate(updated):
+        if not isinstance(item, dict) or not matches(item, filter_queries[identifier]):
+            continue
+        if suffix:
+            replacement = copy.deepcopy(item)
+            _set_path(replacement, suffix, value)
+            updated[item_index] = replacement
+        else:
+            updated[item_index] = json_value(value)
+    _set_path(document, prefix, updated)
+
+
+def _apply_update(
+    document: Dict[str, Any],
+    update: Dict[str, Any],
+    array_filters: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
     if not any(str(key).startswith("$") for key in update):
         return json_value(update)
     output = copy.deepcopy(document)
+    filter_queries = _array_filter_queries(array_filters)
     for operator, changes in update.items():
         if operator == "$set":
             for path, value in changes.items():
-                _set_path(output, path, value)
+                if "$[" in path:
+                    _set_filtered_path(output, path, value, filter_queries)
+                else:
+                    _set_path(output, path, value)
         elif operator == "$unset":
             for path in changes:
                 _delete_path(output, path)
@@ -492,7 +595,13 @@ class PostgresCollection:
         )
         return WriteResult(inserted_id=int(row_id))
 
-    async def update_one(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False) -> WriteResult:
+    async def update_one(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+        upsert: bool = False,
+        array_filters: Optional[List[Dict[str, Any]]] = None,
+    ) -> WriteResult:
         await self._ensure_table()
         async with self.pool.acquire() as connection:
             async with connection.transaction():
@@ -500,14 +609,14 @@ class PostgresCollection:
                 if not rows:
                     if not upsert:
                         return WriteResult()
-                    document = _apply_update(_upsert_base(query), update)
+                    document = _apply_update(_upsert_base(query), update, array_filters)
                     row_id = await connection.fetchval(
                         f"INSERT INTO {self.table_name} (data) VALUES ($1::jsonb) RETURNING row_id",
                         _json_dump(document),
                     )
                     return WriteResult(upserted_id=int(row_id))
                 before = _decode_document(rows[0]["data"])
-                after = _apply_update(before, update)
+                after = _apply_update(before, update, array_filters)
                 modified = int(after != before)
                 if modified:
                     await connection.execute(
@@ -517,13 +626,19 @@ class PostgresCollection:
                     )
                 return WriteResult(matched_count=1, modified_count=modified)
 
-    async def update_many(self, query: Dict[str, Any], update: Dict[str, Any], upsert: bool = False) -> WriteResult:
+    async def update_many(
+        self,
+        query: Dict[str, Any],
+        update: Dict[str, Any],
+        upsert: bool = False,
+        array_filters: Optional[List[Dict[str, Any]]] = None,
+    ) -> WriteResult:
         await self._ensure_table()
         async with self.pool.acquire() as connection:
             async with connection.transaction():
                 rows = await self._rows(query, connection=connection, for_update=True)
                 if not rows and upsert:
-                    document = _apply_update(_upsert_base(query), update)
+                    document = _apply_update(_upsert_base(query), update, array_filters)
                     row_id = await connection.fetchval(
                         f"INSERT INTO {self.table_name} (data) VALUES ($1::jsonb) RETURNING row_id",
                         _json_dump(document),
@@ -532,7 +647,7 @@ class PostgresCollection:
                 modified = 0
                 for row in rows:
                     before = _decode_document(row["data"])
-                    after = _apply_update(before, update)
+                    after = _apply_update(before, update, array_filters)
                     if after != before:
                         await connection.execute(
                             f"UPDATE {self.table_name} SET data = $1::jsonb, updated_at = NOW() WHERE row_id = $2",

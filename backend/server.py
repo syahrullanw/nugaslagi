@@ -2898,6 +2898,21 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
     file_doc = await db.stored_files.find_one({"id": file_id}, {"_id": 0})
     if not file_doc:
         return
+    if file_doc.get("drive_file_id") and file_doc.get("drive_file_url"):
+        await db.stored_files.update_one(
+            {"id": file_id},
+            {
+                "$set": {
+                    "storage_provider": "google_drive",
+                    "upload_status": "uploaded_to_drive",
+                    "drive_sync_status": "synced",
+                    "updated_at": now_iso(),
+                },
+                "$unset": {"drive_error": ""},
+            },
+        )
+        await refresh_embedded_file_references(file_id)
+        return
     settings = await get_google_drive_settings(mask=False)
     if not google_drive_upload_enabled(settings):
         await db.stored_files.update_one(
