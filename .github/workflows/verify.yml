@@ -35,12 +35,20 @@ jobs:
           backend/postgres_database.py
           backend/app_version.py
           backend/identity_integrity.py
+          backend/storage_policy.py
+          backend/user_activity.py
+          backend/user_notifications.py
+          backend/youtube_urls.py
           backend/scripts/repair_duplicate_student_identities.py
       - name: Test PostgreSQL compatibility and identity repair
         run: >-
           python -m pytest -q
           backend/tests/test_postgres_database_compat.py
           backend/tests/test_identity_integrity.py
+          backend/tests/test_storage_policy.py
+          backend/tests/test_user_activity.py
+          backend/tests/test_user_notifications.py
+          backend/tests/test_youtube_urls.py
 
   frontend:
     name: Frontend build

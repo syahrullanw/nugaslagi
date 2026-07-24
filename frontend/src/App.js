@@ -254,6 +254,14 @@ function fmtDate(value) {
   }
 }
 
+function userRoleLabel(role) {
+  return {
+    admin: "Admin",
+    lecturer: "Dosen",
+    student: "Mahasiswa",
+  }[role] || "Pengguna";
+}
+
 function formatApiError(error, fallback) {
   const status = error?.response?.status;
   if (status === 413)
@@ -446,6 +454,48 @@ function normalizedExternalLink(url) {
   const value = String(url || "").trim();
   if (!value) return "";
   return /^https?:\/\//i.test(value) ? value : `https://${value}`;
+}
+
+function youtubeVideoId(url) {
+  const value = String(url || "").trim();
+  if (!value) return "";
+  try {
+    const parsed = new URL(normalizedExternalLink(value));
+    const host = parsed.hostname.toLowerCase();
+    const parts = parsed.pathname.split("/").filter(Boolean);
+    let candidate = "";
+    if (["youtu.be", "www.youtu.be"].includes(host)) {
+      candidate = parts[0] || "";
+    } else if (
+      [
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtube-nocookie.com",
+        "www.youtube-nocookie.com",
+      ].includes(host)
+    ) {
+      if (parts[0]?.toLowerCase() === "watch") {
+        candidate = parsed.searchParams.get("v") || "";
+      } else if (
+        ["embed", "shorts", "live"].includes(parts[0]?.toLowerCase()) &&
+        parts[1]
+      ) {
+        candidate = parts[1];
+      }
+    }
+    return /^[A-Za-z0-9_-]{6,20}$/.test(candidate) ? candidate : "";
+  } catch {
+    return "";
+  }
+}
+
+function youtubeEmbedUrl(url) {
+  const videoId = youtubeVideoId(url);
+  return videoId
+    ? `https://www.youtube-nocookie.com/embed/${videoId}?rel=0`
+    : "";
 }
 
 function otpDeliveryClass(status) {
@@ -650,24 +700,204 @@ const NotificationBadge = memo(function NotificationBadge({ count, testid }) {
   );
 });
 
-function attentionKey(item) {
-  return [
-    item?.id || item?.file_id || "",
-    item?.updated_at ||
-      item?.submitted_at ||
-      item?.reviewed_at ||
-      item?.graded_at ||
-      item?.created_at ||
-      item?.requested_at ||
-      item?.status ||
-      "",
-  ].join(":");
+function useUserNotifications(token) {
+  const [notifications, setNotifications] = useState({
+    items: [],
+    unread_count: 0,
+    total: 0,
+    loading: true,
+  });
+  const auth = useMemo(
+    () => ({ headers: { Authorization: `Bearer ${token}` } }),
+    [token],
+  );
+  const loadNotifications = useCallback(async () => {
+    try {
+      const { data } = await axios.get(`${API}/notifications`, {
+        ...auth,
+        params: { limit: 100 },
+      });
+      setNotifications({
+        items: data.items || [],
+        unread_count: data.unread_count || 0,
+        total: data.total || 0,
+        loading: false,
+      });
+    } catch {
+      setNotifications((current) => ({ ...current, loading: false }));
+    }
+  }, [auth]);
+  useEffect(() => {
+    loadNotifications();
+    const timer = window.setInterval(loadNotifications, 60000);
+    const refreshVisible = () => {
+      if (document.visibilityState === "visible") loadNotifications();
+    };
+    document.addEventListener("visibilitychange", refreshVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", refreshVisible);
+    };
+  }, [loadNotifications]);
+  const markNotificationRead = useCallback(
+    async (notificationId) => {
+      if (!notificationId) return false;
+      try {
+        const { data } = await axios.post(
+          `${API}/notifications/${notificationId}/read`,
+          {},
+          auth,
+        );
+        setNotifications((current) => {
+          const wasUnread = current.items.some(
+            (item) => item.id === notificationId && !item.read,
+          );
+          return {
+            ...current,
+            unread_count: wasUnread
+              ? Math.max(0, current.unread_count - 1)
+              : current.unread_count,
+            items: current.items.map((item) =>
+              item.id === notificationId
+                ? { ...item, read: true, read_at: data.read_at }
+                : item,
+            ),
+          };
+        });
+        return true;
+      } catch {
+        toast.error("Status notifikasi belum dapat disimpan");
+        return false;
+      }
+    },
+    [auth],
+  );
+  return {
+    ...notifications,
+    loadNotifications,
+    markNotificationRead,
+  };
 }
 
-function unseenCount(items, seenKeys = []) {
-  const seen = new Set(seenKeys || []);
-  return (items || []).filter((item) => !seen.has(attentionKey(item))).length;
+function notificationTypeIcon(type) {
+  return {
+    discussion: MessageSquare,
+    submission: Upload,
+    enrollment: Users,
+    assignment: ClipboardList,
+    grade: CheckCircle2,
+    revision: RotateCcw,
+  }[type] || Bell;
 }
+
+const NotificationCenter = memo(function NotificationCenter({
+  notifications,
+  unreadCount,
+  loading,
+  onOpen,
+  testidPrefix,
+}) {
+  const [open, setOpen] = useState(false);
+  const containerRef = useRef(null);
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutside = (event) => {
+      if (!containerRef.current?.contains(event.target)) setOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", closeOnOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeOnOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+  return (
+    <div
+      className="notification-center"
+      ref={containerRef}
+      data-testid={`${testidPrefix}-notification-center`}
+    >
+      <button
+        type="button"
+        className="notification-center-trigger"
+        aria-label={`Notifikasi${unreadCount ? `, ${unreadCount} belum dibaca` : ""}`}
+        aria-expanded={open}
+        data-testid={`${testidPrefix}-notification-button`}
+        onClick={() => setOpen((current) => !current)}
+      >
+        <Bell />
+        {unreadCount > 0 && (
+          <span data-testid={`${testidPrefix}-notification-count`}>
+            {unreadCount > 99 ? "99+" : unreadCount}
+          </span>
+        )}
+      </button>
+      {open && (
+        <section
+          className="notification-center-panel"
+          aria-label="Daftar notifikasi"
+          data-testid={`${testidPrefix}-notification-panel`}
+        >
+          <header>
+            <div>
+              <p>Aktivitas terbaru</p>
+              <strong>Notifikasi</strong>
+            </div>
+            <Badge className="border-blue-200 bg-blue-50 text-blue-700">
+              {unreadCount} belum dibaca
+            </Badge>
+          </header>
+          <p className="notification-center-help">
+            Angka berkurang setelah objek notifikasi benar-benar dibuka.
+          </p>
+          <div className="notification-center-list">
+            {loading ? (
+              <p className="notification-center-empty">Memuat notifikasi…</p>
+            ) : notifications.length === 0 ? (
+              <p className="notification-center-empty">
+                Belum ada aktivitas baru.
+              </p>
+            ) : (
+              notifications.map((notification) => {
+                const Icon = notificationTypeIcon(notification.type);
+                return (
+                  <button
+                    type="button"
+                    key={notification.id}
+                    className={`notification-center-item ${notification.read ? "is-read" : "is-unread"}`}
+                    data-testid={`${testidPrefix}-notification-${notification.id}`}
+                    onClick={() => {
+                      setOpen(false);
+                      onOpen(notification);
+                    }}
+                  >
+                    <span className="notification-center-icon">
+                      <Icon />
+                    </span>
+                    <span className="notification-center-copy">
+                      <strong>{notification.title}</strong>
+                      <span>{notification.message}</span>
+                      <small>{fmtDate(notification.occurred_at)}</small>
+                    </span>
+                    {!notification.read && (
+                      <span
+                        className="notification-center-unread"
+                        aria-label="Belum dibaca"
+                      />
+                    )}
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </section>
+      )}
+    </div>
+  );
+});
 
 const Field = memo(function Field({ id, label, children }) {
   return (
@@ -2332,6 +2562,10 @@ function DrivePage({
                 Saat dosen generate link, aplikasi memakai email Google
                 Workspace dosen tersebut sebagai penyelenggara.
               </p>
+              <p>
+                Jika email dosen bukan pengguna pada domain Workspace yang
+                didelegasikan, aplikasi memakai akun Workspace default di atas.
+              </p>
             </div>
             <Button
               type="button"
@@ -2383,6 +2617,13 @@ function DrivePage({
                 Status ini menjelaskan apakah file sudah ada di Drive atau masih
                 tersimpan lokal.
               </p>
+              <p className="mt-1 text-xs text-slate-500">
+                File gagal dicoba ulang otomatis maksimal{" "}
+                {summary.max_attempts_per_day || 5} kali per hari. Salinan lokal
+                file yang sudah tersinkron dibersihkan setelah{" "}
+                {summary.local_retention_days || 14} hari dan tetap dapat
+                diakses dari Drive.
+              </p>
             </div>
             <Button
               type="button"
@@ -2415,7 +2656,7 @@ function DrivePage({
               icon={AlertTriangle}
               label="Gagal"
               value={summary.failed || 0}
-              hint="Perlu retry/perbaiki Drive"
+              hint="Retry otomatis aktif"
               testid="drive-sync-failed"
             />
             <StatCard
@@ -2461,6 +2702,13 @@ function DrivePage({
                           {formatBytes(item.size)} ·{" "}
                           {fileStatusLabel(item.upload_status)}
                         </p>
+                        {item.drive_sync_status === "synced" && (
+                          <p className="text-xs text-slate-500">
+                            {item.local_available
+                              ? "Salinan lokal masih tersedia"
+                              : "Salinan lokal sudah dibersihkan"}
+                          </p>
+                        )}
                         {item.drive_error && (
                           <p
                             className="mt-1 max-w-md text-xs text-red-700"
@@ -2495,6 +2743,17 @@ function DrivePage({
                       >
                         {driveSyncLabel(item.drive_sync_status)}
                       </Badge>
+                      {["failed", "pending"].includes(
+                        item.drive_sync_status,
+                      ) && (
+                        <p className="mt-1 text-xs text-slate-500">
+                          Percobaan {item.drive_sync_attempts_today || 0}/
+                          {summary.max_attempts_per_day || 5}
+                          {item.drive_next_retry_at
+                            ? ` · berikutnya ${fmtDate(item.drive_next_retry_at)}`
+                            : ""}
+                        </p>
+                      )}
                     </TableCell>
                     <TableCell className="text-sm text-slate-500">
                       {fmtDate(item.updated_at || item.uploaded_at)}
@@ -3002,20 +3261,18 @@ function AdminApp({
   const [materialFileInputKey, setMaterialFileInputKey] = useState(0);
   const [assignmentFiles, setAssignmentFiles] = useState([]);
   const [assignmentFileInputKey, setAssignmentFileInputKey] = useState(0);
-  const seenStorageKey = `elearn_admin_seen_${user.id}`;
-  const [seenBadges, setSeenBadges] = useState(() => {
-    try {
-      return JSON.parse(
-        localStorage.getItem(`elearn_admin_seen_${user.id}`) || "{}",
-      );
-    } catch {
-      return {};
-    }
-  });
+  const [notificationFocus, setNotificationFocus] = useState(null);
   const auth = useMemo(
     () => ({ headers: { Authorization: `Bearer ${token}` } }),
     [token],
   );
+  const {
+    items: notificationItems,
+    unread_count: notificationUnreadCount,
+    loading: notificationLoading,
+    loadNotifications,
+    markNotificationRead,
+  } = useUserNotifications(token);
   const progress = useActionProgress();
 
   async function loadAll(event) {
@@ -3198,6 +3455,14 @@ function AdminApp({
     event.preventDefault();
     const targetClass = data.classes.find((item) => item.id === forms.material.class_id);
     if (targetClass && targetClass.status !== "active") return toast.error("Materi hanya dapat diubah pada kelas Aktif");
+    if (
+      forms.material.video_url &&
+      !youtubeVideoId(forms.material.video_url)
+    ) {
+      return toast.error(
+        "Masukkan link video YouTube yang valid sebelum menyimpan materi",
+      );
+    }
     const { id, ...payload } = forms.material;
     if (!window.confirm(id ? "Simpan perubahan materi ini?" : "Publikasikan materi ini ke kelas aktif?")) return;
     let saved = null;
@@ -4121,63 +4386,33 @@ function AdminApp({
       toast.error(detail);
     }
   }
-  const submissionReviewItems = (data.submissions || []).filter(
-    needsSubmissionReview,
-  );
-  const enrollmentItems = (data.enrollments || []).filter(
-    (item) => item.status === "pending",
-  );
-  const whatsappItems = (data.whatsappMessages || []).filter((item) =>
-    ["failed", "pending_config"].includes(item.status),
-  );
-  const materialCommentItems = data.dashboard?.latest_comments || [];
-  const unseenSubmissions = unseenCount(
-    submissionReviewItems,
-    seenBadges.submissionReviews,
-  );
-  const unseenEnrollments = unseenCount(enrollmentItems, seenBadges.students);
-  const unseenWhatsapp = unseenCount(whatsappItems, seenBadges.whatsapp);
-  const unseenMaterials = unseenCount(
-    materialCommentItems,
-    seenBadges.materials,
-  );
-  const adminBadges = {
-    dashboard:
-      unseenSubmissions + unseenEnrollments + unseenWhatsapp + unseenMaterials,
-    assignments: unseenSubmissions,
-    grading: unseenSubmissions,
-    students: unseenEnrollments,
-    materials: unseenMaterials,
-    whatsapp: unseenWhatsapp,
-  };
-  function saveSeenBadges(next) {
-    setSeenBadges(next);
-    localStorage.setItem(seenStorageKey, JSON.stringify(next));
-  }
-  function rememberCategorySeen(items) {
-    return (items || []).map(attentionKey);
-  }
-  function markAdminPageSeen(targetPage) {
-    const next = { ...seenBadges };
-    if (targetPage === "dashboard") {
-      next.submissionReviews = rememberCategorySeen(submissionReviewItems);
-      next.students = rememberCategorySeen(enrollmentItems);
-      next.materials = rememberCategorySeen(materialCommentItems);
-      next.whatsapp = rememberCategorySeen(whatsappItems);
-    } else if (targetPage === "assignments" || targetPage === "grading") {
-      next.submissionReviews = rememberCategorySeen(submissionReviewItems);
-    } else if (targetPage === "students") {
-      next.students = rememberCategorySeen(enrollmentItems);
-    } else if (targetPage === "materials") {
-      next.materials = rememberCategorySeen(materialCommentItems);
-    } else if (targetPage === "whatsapp") {
-      next.whatsapp = rememberCategorySeen(whatsappItems);
-    }
-    saveSeenBadges(next);
-  }
+  const adminBadges = notificationItems
+    .filter((item) => !item.read)
+    .reduce(
+      (counts, item) => {
+        const targetPage = item.target?.page || "dashboard";
+        counts.dashboard += 1;
+        counts[targetPage] = (counts[targetPage] || 0) + 1;
+        if (targetPage === "grading")
+          counts.assignments = (counts.assignments || 0) + 1;
+        return counts;
+      },
+      { dashboard: 0 },
+    );
   function openAdminPage(targetPage) {
-    markAdminPageSeen(targetPage);
     setPage(targetPage);
+  }
+  function openAdminNotification(notification) {
+    const targetPage = notification.target?.page || "dashboard";
+    setNotificationFocus(notification);
+    setPage(targetPage);
+  }
+  async function finishAdminNotification(notificationId) {
+    const saved = await markNotificationRead(notificationId);
+    setNotificationFocus((current) =>
+      current?.id === notificationId ? null : current,
+    );
+    return saved;
   }
   const navGroups = [
     {
@@ -4328,6 +4563,13 @@ function AdminApp({
               </h1>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <NotificationCenter
+                notifications={notificationItems}
+                unreadCount={notificationUnreadCount}
+                loading={notificationLoading}
+                onOpen={openAdminNotification}
+                testidPrefix="admin"
+              />
               <Badge
                 className="border-slate-200 bg-white text-slate-700"
                 data-testid="admin-user-badge"
@@ -4344,7 +4586,9 @@ function AdminApp({
               <Button
                 variant="outline"
                 data-testid="admin-refresh-button"
-                onClick={loadAll}
+                onClick={async (event) => {
+                  await Promise.all([loadAll(event), loadNotifications()]);
+                }}
               >
                 Refresh
               </Button>
@@ -4426,6 +4670,12 @@ function AdminApp({
               importStudents={importStudents}
               setImportFile={setImportFile}
               isCampusAdmin={isCampusAdmin}
+              notificationFocus={
+                notificationFocus?.target?.page === "students"
+                  ? notificationFocus
+                  : null
+              }
+              onNotificationOpened={finishAdminNotification}
             />
           )}
           {page === "materials" && (
@@ -4440,6 +4690,12 @@ function AdminApp({
               materialFileInputKey={materialFileInputKey}
               setMaterialFileInputKey={setMaterialFileInputKey}
               token={token}
+              notificationFocus={
+                notificationFocus?.target?.page === "materials"
+                  ? notificationFocus
+                  : null
+              }
+              onNotificationOpened={finishAdminNotification}
             />
           )}
           {page === "assignments" && (
@@ -4466,6 +4722,12 @@ function AdminApp({
               markReviewed={markReviewed}
               requestRevision={requestRevision}
               token={token}
+              notificationFocus={
+                notificationFocus?.target?.page === "grading"
+                  ? notificationFocus
+                  : null
+              }
+              onNotificationOpened={finishAdminNotification}
             />
           )}
           {page === "weights" && (
@@ -5403,6 +5665,10 @@ const DashboardPage = memo(function DashboardPage({
     });
   }, [submissions]);
   const latestComments = data.dashboard?.latest_comments || [];
+  const userActivity = data.dashboard?.user_activity || null;
+  const activitySummary = userActivity?.summary || {};
+  const activityTrend = userActivity?.trend || [];
+  const recentUserActivity = userActivity?.recent || [];
   const activeLecturers = (data.lecturers || []).filter(
     (lecturer) => lecturer.status === "active",
   ).length;
@@ -5632,6 +5898,141 @@ const DashboardPage = memo(function DashboardPage({
           </CardContent>
         </Card>
       </div>
+
+      {isCampusAdmin && userActivity && (
+        <Card
+          className="dashboard-panel-card dashboard-user-activity-card"
+          data-testid="dashboard-user-activity-card"
+        >
+          <CardHeader className="dashboard-panel-header">
+            <div>
+              <p>{userActivity.days || 14} hari terakhir</p>
+              <CardTitle data-testid="dashboard-user-activity-title">
+                Aktivitas pengguna
+              </CardTitle>
+            </div>
+            <div className="dashboard-user-activity-badges">
+              <Badge className="border-blue-200 bg-blue-50 text-blue-700">
+                {activitySummary.active_today || 0} aktif hari ini
+              </Badge>
+              <Badge className="border-emerald-200 bg-emerald-50 text-emerald-700">
+                {activitySummary.active_users || 0} pengguna unik
+              </Badge>
+            </div>
+          </CardHeader>
+          <CardContent className="dashboard-user-activity-content">
+            <div className="dashboard-user-activity-chart">
+              <div className="dashboard-user-activity-summary">
+                <div>
+                  <span>Aktivitas</span>
+                  <strong>{activitySummary.activities || 0}</strong>
+                </div>
+                <div>
+                  <span>Login</span>
+                  <strong>{activitySummary.logins || 0}</strong>
+                </div>
+                <div>
+                  <span>Permintaan gagal</span>
+                  <strong>{activitySummary.failures || 0}</strong>
+                </div>
+                <div>
+                  <span>Retensi log</span>
+                  <strong>{userActivity.retention_days || 180} hari</strong>
+                </div>
+              </div>
+              <ResponsiveContainer width="100%" height={290}>
+                <BarChart
+                  data={activityTrend}
+                  margin={{ top: 12, right: 12, left: -18, bottom: 0 }}
+                >
+                  <CartesianGrid
+                    stroke="#e2e8f0"
+                    strokeDasharray="4 4"
+                    vertical={false}
+                  />
+                  <XAxis
+                    dataKey="label"
+                    tick={{ fontSize: 11, fill: "#64748b" }}
+                    tickLine={false}
+                    axisLine={false}
+                  />
+                  <YAxis
+                    allowDecimals={false}
+                    tick={{ fontSize: 11, fill: "#64748b" }}
+                    tickLine={false}
+                    axisLine={false}
+                  />
+                  <Tooltip />
+                  <Legend iconType="circle" iconSize={8} />
+                  <Bar
+                    dataKey="activities"
+                    name="Aktivitas"
+                    fill="#2563eb"
+                    radius={[5, 5, 0, 0]}
+                  />
+                  <Bar
+                    dataKey="active_users"
+                    name="Pengguna aktif"
+                    fill="#10b981"
+                    radius={[5, 5, 0, 0]}
+                  />
+                  <Bar
+                    dataKey="logins"
+                    name="Login"
+                    fill="#8b5cf6"
+                    radius={[5, 5, 0, 0]}
+                  />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            <div
+              className="dashboard-user-activity-recent"
+              data-testid="dashboard-user-activity-recent"
+            >
+              <div className="dashboard-user-activity-recent-heading">
+                <div>
+                  <p>Audit trail</p>
+                  <strong>Aktivitas terbaru</strong>
+                </div>
+                <small>Tanpa password, token, atau isi request</small>
+              </div>
+              {recentUserActivity.length === 0 ? (
+                <div className="dashboard-empty-panel">
+                  <Clock />
+                  <strong>Belum ada log aktivitas</strong>
+                  <p>Aktivitas akan tercatat saat pengguna memakai aplikasi.</p>
+                </div>
+              ) : (
+                recentUserActivity.slice(0, 8).map((activity) => (
+                  <article key={activity.id}>
+                    <span>
+                      {activity.success ? <CheckCircle2 /> : <AlertTriangle />}
+                    </span>
+                    <div>
+                      <strong>{activity.user_name || "Pengguna"}</strong>
+                      <p>{activity.activity_label || activity.action}</p>
+                      <small>
+                        {userRoleLabel(activity.user_role)} ·{" "}
+                        {fmtDate(activity.created_at)} · {activity.duration_ms || 0}
+                        ms
+                      </small>
+                    </div>
+                    <Badge
+                      className={
+                        activity.success
+                          ? "border-slate-200 bg-slate-50 text-slate-700"
+                          : "border-red-200 bg-red-50 text-red-700"
+                      }
+                    >
+                      {activity.status_code}
+                    </Badge>
+                  </article>
+                ))
+              )}
+            </div>
+          </CardContent>
+        </Card>
+      )}
 
       <div className="dashboard-lower-grid">
         <Card
@@ -6282,6 +6683,8 @@ function StudentsPage({
   importStudents,
   setImportFile,
   isCampusAdmin,
+  notificationFocus,
+  onNotificationOpened,
 }) {
   const [studentSearch, setStudentSearch] = useState("");
   const [selectedStudentIds, setSelectedStudentIds] = useState([]);
@@ -6289,6 +6692,7 @@ function StudentsPage({
   const [studentSection, setStudentSection] = useState(
     isCampusAdmin ? "data" : "classes",
   );
+  const openedNotificationRef = useRef("");
   const pending = data.enrollments?.filter((r) => r.status === "pending") || [];
   const classById = useMemo(() => new Map(data.classes.map((item) => [item.id, item])), [data.classes]);
   const activeClasses = data.classes.filter((item) => item.status === "active");
@@ -6326,6 +6730,30 @@ function StudentsPage({
       !progressCourseId ||
       s.class_ids?.some((id) => progressClassIds.includes(id)),
   );
+  useEffect(() => {
+    const requestId = notificationFocus?.target?.request_id;
+    if (
+      !requestId ||
+      openedNotificationRef.current === notificationFocus?.id ||
+      !pending.some((item) => item.id === requestId)
+    )
+      return undefined;
+    setStudentSection("classes");
+    const timer = window.setTimeout(() => {
+      const target = document.querySelector(
+        `[data-testid="enrollment-request-row-${requestId}"]`,
+      );
+      if (!target) return;
+      openedNotificationRef.current = notificationFocus.id;
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      Promise.resolve(onNotificationOpened?.(notificationFocus.id)).then(
+        (saved) => {
+          if (saved === false) openedNotificationRef.current = "";
+        },
+      );
+    }, 160);
+    return () => window.clearTimeout(timer);
+  }, [notificationFocus, onNotificationOpened, pending]);
   const setManagedClass = (classId) => {
     setSelectedStudentIds([]);
     setForms({
@@ -6617,7 +7045,11 @@ function StudentsPage({
                 pending.map((r) => (
                   <div
                     key={r.id}
-                    className="flex flex-wrap items-center justify-between gap-3 border border-slate-200 p-3"
+                    className={`flex flex-wrap items-center justify-between gap-3 border border-slate-200 p-3 ${
+                      notificationFocus?.target?.request_id === r.id
+                        ? "notification-object-focus"
+                        : ""
+                    }`}
                     data-testid={`enrollment-request-row-${r.id}`}
                   >
                     <div>
@@ -7062,13 +7494,20 @@ function StudentsPage({
   );
 }
 
-function DiscussionThread({ material, token }) {
+function DiscussionThread({
+  material,
+  token,
+  focusCommentId = "",
+  focusNotificationId = "",
+  onFocusOpened,
+}) {
   const discussionReadOnly = material.class_allows_learning === false;
   const [comments, setComments] = useState([]);
   const [drafts, setDrafts] = useState({});
   const [attachments, setAttachments] = useState({});
   const [replyTo, setReplyTo] = useState("");
   const [uploadVersion, setUploadVersion] = useState(0);
+  const openedFocusRef = useRef("");
   const auth = useMemo(
     () => ({ headers: { Authorization: `Bearer ${token}` } }),
     [token],
@@ -7095,6 +7534,32 @@ function DiscussionThread({ material, token }) {
         toast.error(error.response?.data?.detail || "Diskusi gagal dimuat"),
       );
   }, [material.id, auth]);
+  useEffect(() => {
+    if (
+      !focusCommentId ||
+      !focusNotificationId ||
+      openedFocusRef.current === focusNotificationId ||
+      !comments.some((item) => item.id === focusCommentId)
+    )
+      return undefined;
+    const timer = window.setTimeout(() => {
+      const target = document.querySelector(
+        `[data-testid="discussion-comment-${focusCommentId}"]`,
+      );
+      if (!target) return;
+      openedFocusRef.current = focusNotificationId;
+      target.scrollIntoView({ behavior: "smooth", block: "center" });
+      Promise.resolve(onFocusOpened?.(focusNotificationId)).then((saved) => {
+        if (saved === false) openedFocusRef.current = "";
+      });
+    }, 160);
+    return () => window.clearTimeout(timer);
+  }, [
+    comments,
+    focusCommentId,
+    focusNotificationId,
+    onFocusOpened,
+  ]);
 
   async function submitComment(parentId = "") {
     const key = parentId || "root";
@@ -7218,7 +7683,9 @@ function DiscussionThread({ material, token }) {
     return (
       <div
         key={comment.id}
-        className={`discussion-comment ${depth ? "nested" : ""}`}
+        className={`discussion-comment ${depth ? "nested" : ""} ${
+          focusCommentId === comment.id ? "notification-object-focus" : ""
+        }`}
         data-testid={`discussion-comment-${comment.id}`}
       >
         <div className="discussion-comment-header">
@@ -7293,6 +7760,8 @@ function MaterialsPage({
   materialFileInputKey,
   setMaterialFileInputKey,
   token,
+  notificationFocus,
+  onNotificationOpened,
 }) {
   const [selectedClassId, setSelectedClassId] = useState("");
   const editingMaterial = data.materials.find(
@@ -7342,6 +7811,12 @@ function MaterialsPage({
     (total, group) => total + group.linkedAssignments.length,
     0,
   );
+  useEffect(() => {
+    const materialId = notificationFocus?.target?.material_id;
+    if (!materialId) return;
+    const material = data.materials.find((item) => item.id === materialId);
+    if (material?.class_id) setSelectedClassId(material.class_id);
+  }, [data.materials, notificationFocus]);
 
   async function generateMaterialMeetLink() {
     if (!forms.material.class_id)
@@ -7363,7 +7838,11 @@ function MaterialsPage({
           meeting_url: result.meeting_url,
         },
       }));
-      toast.success("Link Google Meet berhasil dibuat");
+      toast.success(
+        result.organizer_fallback_used
+          ? "Link Google Meet dibuat dengan penyelenggara Workspace default"
+          : "Link Google Meet berhasil dibuat",
+      );
     } catch (error) {
       toast.error(
         error.response?.data?.detail || "Link Google Meet gagal dibuat",
@@ -7746,6 +8225,49 @@ function MaterialsPage({
               placeholder="https://... atau kosongkan jika mengunggah file"
             />
           </Field>
+          <div className="material-youtube-field">
+            <Field
+              id="material-video-url"
+              label="Link video YouTube (opsional)"
+            >
+              <Input
+                id="material-video-url"
+                type="url"
+                data-testid="material-video-url-input"
+                value={forms.material.video_url || ""}
+                onChange={(e) =>
+                  setForms({
+                    ...forms,
+                    material: {
+                      ...forms.material,
+                      video_url: e.target.value,
+                    },
+                  })
+                }
+                placeholder="https://www.youtube.com/watch?v=..."
+              />
+            </Field>
+            <p className="material-youtube-help">
+              Gunakan link video YouTube, YouTube Shorts, atau youtu.be. Video
+              akan tampil langsung dan responsif di halaman materi mahasiswa.
+            </p>
+            {forms.material.video_url &&
+              (youtubeVideoId(forms.material.video_url) ? (
+                <p
+                  className="material-youtube-validation is-valid"
+                  data-testid="material-video-url-valid"
+                >
+                  <CheckCircle2 /> Link YouTube siap ditampilkan.
+                </p>
+              ) : (
+                <p
+                  className="material-youtube-validation is-invalid"
+                  data-testid="material-video-url-invalid"
+                >
+                  <AlertTriangle /> Link belum dikenali sebagai video YouTube.
+                </p>
+              ))}
+          </div>
           <div
             className="space-y-3 border border-emerald-200 bg-emerald-50 p-4"
             data-testid="material-online-meeting-panel"
@@ -7839,7 +8361,10 @@ function MaterialsPage({
             )}
           </div>
         </form>
-        <div className="space-y-4" data-testid="material-list">
+        <div
+          className="admin-detail-list-pane space-y-4"
+          data-testid="material-list"
+        >
           {selectedGroup.materials.length === 0 ? (
             <EmptyState
               title="Belum ada materi"
@@ -7937,6 +8462,17 @@ function MaterialsPage({
                           "Buka lampiran materi"}
                       </a>
                     )}
+                    {youtubeVideoId(material.video_url) && (
+                      <a
+                        href={material.video_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="mt-3 inline-flex items-center gap-2 text-sm font-semibold text-red-700 underline"
+                        data-testid={`material-video-${material.id}-link`}
+                      >
+                        <Video className="h-4 w-4" /> Buka video YouTube
+                      </a>
+                    )}
                     {material.meeting_type === "online" &&
                       material.meeting_url && (
                         <a
@@ -7981,7 +8517,21 @@ function MaterialsPage({
                         ))}
                       </div>
                     )}
-                    <DiscussionThread material={material} token={token} />
+                    <DiscussionThread
+                      material={material}
+                      token={token}
+                      focusCommentId={
+                        notificationFocus?.target?.material_id === material.id
+                          ? notificationFocus.target.comment_id
+                          : ""
+                      }
+                      focusNotificationId={
+                        notificationFocus?.target?.material_id === material.id
+                          ? notificationFocus.id
+                          : ""
+                      }
+                      onFocusOpened={onNotificationOpened}
+                    />
                   </CardContent>
                 </Card>
               );
@@ -8003,6 +8553,8 @@ function StudentMaterialsPage({
   assignments,
   token,
   renderAssignmentCard,
+  notificationFocus,
+  onNotificationOpened,
 }) {
   const orderedMaterials = useMemo(
     () =>
@@ -8079,6 +8631,9 @@ function StudentMaterialsPage({
       (material) => material.id === selectedMaterialId,
     ) || selectedGroup?.materials[0];
   const selectedMaterialIdentifier = selectedMaterial?.id || "";
+  const selectedYoutubeEmbedUrl = youtubeEmbedUrl(
+    selectedMaterial?.video_url,
+  );
   const relatedAssignments = useMemo(
     () =>
       selectedMaterialIdentifier
@@ -8101,6 +8656,16 @@ function StudentMaterialsPage({
       setSelectedGroupId("");
     }
   }, [groups, selectedGroupId]);
+  useEffect(() => {
+    const materialId = notificationFocus?.target?.material_id;
+    if (!materialId) return;
+    const focusedGroup = groups.find((group) =>
+      group.materials.some((material) => material.id === materialId),
+    );
+    if (!focusedGroup) return;
+    setSelectedGroupId(focusedGroup.id);
+    setSelectedMaterialId(materialId);
+  }, [groups, notificationFocus]);
 
   useEffect(() => {
     if (!selectedGroup) {
@@ -8400,6 +8965,40 @@ function StudentMaterialsPage({
             <p className="meeting-material-description">
               {selectedMaterial.description || "Tidak ada deskripsi materi."}
             </p>
+            {selectedYoutubeEmbedUrl && (
+              <section
+                className="youtube-embed-card"
+                data-testid={`student-material-video-${selectedMaterial.id}`}
+              >
+                <div className="youtube-embed-frame">
+                  <iframe
+                    src={selectedYoutubeEmbedUrl}
+                    title={`Video ${selectedMaterial.title}`}
+                    loading="lazy"
+                    allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                    referrerPolicy="strict-origin-when-cross-origin"
+                    allowFullScreen
+                    data-testid={`student-material-video-${selectedMaterial.id}-iframe`}
+                  />
+                </div>
+                <footer className="youtube-embed-footer">
+                  <div>
+                    <Video />
+                    <span>
+                      <strong>Video pembelajaran</strong>
+                      <small>Diputar langsung dari YouTube</small>
+                    </span>
+                  </div>
+                  <a
+                    href={selectedMaterial.video_url}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    Buka di YouTube
+                  </a>
+                </footer>
+              </section>
+            )}
             <div className="meeting-resource-grid">
               <section
                 className="meeting-resource-panel"
@@ -8422,17 +9021,6 @@ function StudentMaterialsPage({
                     <FileText />{" "}
                     {selectedMaterial.attachment?.file_name ||
                       "Buka materi pembelajaran"}
-                  </a>
-                )}
-                {selectedMaterial.video_url && (
-                  <a
-                    className="meeting-resource-link"
-                    href={selectedMaterial.video_url}
-                    target="_blank"
-                    rel="noreferrer"
-                    data-testid={`student-material-video-${selectedMaterial.id}-link`}
-                  >
-                    <Eye /> Tonton video materi
                   </a>
                 )}
                 {selectedMaterial.meeting_type === "online" &&
@@ -8514,7 +9102,13 @@ function StudentMaterialsPage({
                 {selectedAssignment && renderAssignmentCard(selectedAssignment)}
               </section>
             )}
-            <DiscussionThread material={selectedMaterial} token={token} />
+            <DiscussionThread
+              material={selectedMaterial}
+              token={token}
+              focusCommentId={notificationFocus?.target?.comment_id || ""}
+              focusNotificationId={notificationFocus?.id || ""}
+              onFocusOpened={onNotificationOpened}
+            />
           </article>
         )}
       </div>
@@ -9214,7 +9808,10 @@ function AssignmentsPage({
             )}
           </div>
         </form>
-        <div className="space-y-4" data-testid="assignment-list">
+        <div
+          className="admin-detail-list-pane space-y-4"
+          data-testid="assignment-list"
+        >
           {selectedGroup.assignments.length === 0 ? (
             <EmptyState
               title="Belum ada tugas"
@@ -9515,6 +10112,8 @@ function GradingPage({
   markReviewed,
   requestRevision,
   token,
+  notificationFocus,
+  onNotificationOpened,
 }) {
   const progress = useActionProgress();
   const [gradeRows, setGradeRows] = useState({});
@@ -9529,6 +10128,7 @@ function GradingPage({
   const [previewBusy, setPreviewBusy] = useState(false);
   const [previewError, setPreviewError] = useState("");
   const initializedClassRef = useRef("");
+  const openedNotificationRef = useRef("");
   const classOptions = useMemo(() => data.classes || [], [data.classes]);
   const selectedClass = classOptions.find((c) => c.id === selectedClassId);
   const gradingReadOnly = Boolean(selectedClass && selectedClass.allows_grading === false);
@@ -9747,6 +10347,48 @@ function GradingPage({
       },
     }));
   }, [selectedClassId, ready, forms.grade.submission_id, setForms]);
+  useEffect(() => {
+    const submissionId = notificationFocus?.target?.submission_id;
+    if (!submissionId) return;
+    const submission = (data.submissions || []).find(
+      (item) => item.id === submissionId,
+    );
+    if (!submission) return;
+    setSelectedClassId(submission.class_id || "");
+    setFilter({ assignment_id: "", status: "all", query: "" });
+    setForms((current) => ({
+      ...current,
+      grade: {
+        ...current.grade,
+        submission_id: submission.id,
+        score: submission.grade ?? "",
+        feedback: submission.feedback || "",
+        revision_note: submission.revision_note || "",
+      },
+    }));
+  }, [data.submissions, notificationFocus, setForms]);
+  useEffect(() => {
+    if (
+      !notificationFocus?.id ||
+      selectedSubmission?.id !== notificationFocus.target?.submission_id ||
+      openedNotificationRef.current === notificationFocus.id
+    )
+      return undefined;
+    const timer = window.setTimeout(() => {
+      const target = document.querySelector(
+        '[data-testid="grading-detail-page"]',
+      );
+      if (!target) return;
+      openedNotificationRef.current = notificationFocus.id;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      Promise.resolve(onNotificationOpened?.(notificationFocus.id)).then(
+        (saved) => {
+          if (saved === false) openedNotificationRef.current = "";
+        },
+      );
+    }, 160);
+    return () => window.clearTimeout(timer);
+  }, [notificationFocus, onNotificationOpened, selectedSubmission]);
 
   function chooseSubmission(submission) {
     setForms((current) => ({
@@ -9888,7 +10530,14 @@ function GradingPage({
   }
 
   return (
-    <div className="space-y-5" data-testid="grading-detail-page">
+    <div
+      className={`space-y-5 ${
+        notificationFocus?.target?.submission_id === selectedSubmission?.id
+          ? "notification-object-focus"
+          : ""
+      }`}
+      data-testid="grading-detail-page"
+    >
       <section className="grading-detail-hero" data-testid="grading-detail-header">
         <Button
           variant="outline"
@@ -11663,6 +12312,8 @@ function StudentAssignmentsPage({
   renderAssignmentCard,
   focusAssignmentId,
   onFocusHandled,
+  focusNotificationId,
+  onNotificationOpened,
 }) {
   const groups = useMemo(
     () => buildAssignmentCourseGroups(assignments),
@@ -11696,13 +12347,21 @@ function StudentAssignmentsPage({
     if (!focusedGroup) return undefined;
     setSelectedGroupId(focusedGroup.id);
     const timer = window.setTimeout(() => {
-      document
-        .getElementById(`assignment-${focusAssignmentId}`)
-        ?.scrollIntoView({ behavior: "smooth", block: "start" });
+      const target = document.getElementById(`assignment-${focusAssignmentId}`);
+      if (!target) return;
+      target.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (focusNotificationId)
+        onNotificationOpened?.(focusNotificationId);
       onFocusHandled?.();
     }, 120);
     return () => window.clearTimeout(timer);
-  }, [focusAssignmentId, groups, onFocusHandled]);
+  }, [
+    focusAssignmentId,
+    focusNotificationId,
+    groups,
+    onFocusHandled,
+    onNotificationOpened,
+  ]);
 
   function openGroup(groupId) {
     setSelectedGroupId(groupId);
@@ -12163,10 +12822,17 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
   const [classCode, setClassCode] = useState("");
   const [studentPage, setStudentPage] = useState("home");
   const [assignmentFocusId, setAssignmentFocusId] = useState("");
+  const [notificationFocus, setNotificationFocus] = useState(null);
   const auth = useMemo(
     () => ({ headers: { Authorization: `Bearer ${token}` } }),
     [token],
   );
+  const {
+    items: notificationItems,
+    unread_count: notificationUnreadCount,
+    loading: notificationLoading,
+    markNotificationRead,
+  } = useUserNotifications(token);
   const progress = useActionProgress();
   async function loadStudent() {
     const [
@@ -12491,6 +13157,27 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
   function openStudentAssignment(assignmentId) {
     setAssignmentFocusId(assignmentId);
     setStudentPage("assignments");
+  }
+  function openStudentNotification(notification) {
+    const target = notification.target || {};
+    setNotificationFocus(notification);
+    if (target.page === "courses") {
+      setStudentPage("courses");
+      return;
+    }
+    if (target.assignment_id) {
+      setAssignmentFocusId(target.assignment_id);
+      setStudentPage("assignments");
+      return;
+    }
+    setStudentPage(target.page || "home");
+  }
+  async function finishStudentNotification(notificationId) {
+    const saved = await markNotificationRead(notificationId);
+    setNotificationFocus((current) =>
+      current?.id === notificationId ? null : current,
+    );
+    return saved;
   }
   const renderAssignmentCard = (a) => {
     const uploadState = uploadMap[a.id] || {};
@@ -12885,6 +13572,13 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
+              <NotificationCenter
+                notifications={notificationItems}
+                unreadCount={notificationUnreadCount}
+                loading={notificationLoading}
+                onOpen={openStudentNotification}
+                testidPrefix="student"
+              />
               {studentActionCount > 0 && (
                 <Badge
                   className="border-amber-200 bg-amber-50 text-amber-700"
@@ -13233,6 +13927,12 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               assignments={data.assignments}
               token={token}
               renderAssignmentCard={renderAssignmentCard}
+              notificationFocus={
+                notificationFocus?.target?.page === "courses"
+                  ? notificationFocus
+                  : null
+              }
+              onNotificationOpened={finishStudentNotification}
             />
           )}
           {studentPage === "grades" && (
@@ -13248,6 +13948,12 @@ function StudentApp({ token, user, onLogout, branding, onUserUpdate, version }) 
               renderAssignmentCard={renderAssignmentCard}
               focusAssignmentId={assignmentFocusId}
               onFocusHandled={() => setAssignmentFocusId("")}
+              focusNotificationId={
+                notificationFocus?.target?.assignment_id === assignmentFocusId
+                  ? notificationFocus.id
+                  : ""
+              }
+              onNotificationOpened={finishStudentNotification}
             />
           )}
           {studentPage === "calendar" && (

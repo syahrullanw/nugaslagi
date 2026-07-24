@@ -11,6 +11,7 @@ import logging
 import os
 import re
 import secrets
+import tempfile
 import time
 import uuid
 import zipfile
@@ -36,9 +37,10 @@ from fastapi.responses import FileResponse, RedirectResponse, StreamingResponse
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload, MediaIoBaseUpload
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload, MediaIoBaseUpload
 from openpyxl import Workbook, load_workbook
 from pydantic import BaseModel, EmailStr, Field
+from starlette.background import BackgroundTask
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
@@ -50,6 +52,17 @@ try:
         student_identity_conflict_query,
         student_identity_values,
     )
+    from .storage_policy import (
+        DRIVE_LOCAL_RETENTION_DAYS,
+        DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY,
+        local_copy_is_expired,
+        next_drive_retry_at,
+        retry_is_due,
+        sync_attempt_day,
+    )
+    from .user_activity import aggregate_user_activity, classify_activity
+    from .user_notifications import finalize_notifications, notification_event
+    from .youtube_urls import normalize_youtube_url
 except ImportError:  # Supports `uvicorn server:app` from the backend directory.
     from postgres_database import PostgresDatabase
     from app_version import version_payload
@@ -58,6 +71,17 @@ except ImportError:  # Supports `uvicorn server:app` from the backend directory.
         student_identity_conflict_query,
         student_identity_values,
     )
+    from storage_policy import (
+        DRIVE_LOCAL_RETENTION_DAYS,
+        DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY,
+        local_copy_is_expired,
+        next_drive_retry_at,
+        retry_is_due,
+        sync_attempt_day,
+    )
+    from user_activity import aggregate_user_activity, classify_activity
+    from user_notifications import finalize_notifications, notification_event
+    from youtube_urls import normalize_youtube_url
 
 
 ROOT_DIR = Path(__file__).parent
@@ -72,6 +96,8 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 _whatsapp_send_lock = asyncio.Lock()
 _material_creation_lock = asyncio.Lock()
+_drive_sync_attempt_lock = asyncio.Lock()
+_user_activity_cleanup_lock = asyncio.Lock()
 
 _settings_cache: Dict[str, Any] = {}
 _settings_cache_times: Dict[str, float] = {}
@@ -80,6 +106,20 @@ _oidc_discovery_cache: Dict[str, Any] = {}
 _oidc_discovery_cached_at = 0.0
 _OIDC_DISCOVERY_CACHE_TTL = 300.0
 _oidc_runtime_settings: Dict[str, Any] = {}
+_last_user_activity_cleanup_at = 0.0
+USER_ACTIVITY_TIMEZONE = ZoneInfo(os.environ.get("USER_ACTIVITY_TIMEZONE", "Asia/Jakarta"))
+USER_ACTIVITY_RETENTION_DAYS = max(
+    30,
+    int(os.environ.get("USER_ACTIVITY_RETENTION_DAYS", "180")),
+)
+NOTIFICATION_LOOKBACK_DAYS = max(
+    7,
+    min(int(os.environ.get("NOTIFICATION_LOOKBACK_DAYS", "30")), 90),
+)
+NOTIFICATION_READ_RETENTION_DAYS = max(
+    NOTIFICATION_LOOKBACK_DAYS,
+    int(os.environ.get("NOTIFICATION_READ_RETENTION_DAYS", "180")),
+)
 
 
 def env_enabled(name: str, default: bool = False) -> bool:
@@ -148,6 +188,101 @@ def _invalidate_settings_cache(key: str = "") -> None:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def should_log_user_activity(method: str, path: str) -> bool:
+    clean_method = str(method or "").upper()
+    clean_path = str(path or "")
+    if clean_method in {"OPTIONS", "HEAD"}:
+        return False
+    ignored = {
+        "/api/version",
+        "/api/settings/public",
+        "/api/auth/me",
+        "/api/auth/sso/config",
+        "/api/user-activity",
+        "/api/notifications",
+    }
+    return (
+        clean_path not in ignored
+        and not clean_path.startswith("/api/user-activity/")
+        and not clean_path.startswith("/api/notifications/")
+    )
+
+
+def request_client_ip(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    forwarded = str(request.headers.get("x-forwarded-for") or "").split(",", 1)[0].strip()
+    return (forwarded or str(request.client.host if request.client else ""))[:64]
+
+
+async def cleanup_old_user_activity_logs() -> None:
+    global _last_user_activity_cleanup_at
+    current_monotonic = time.monotonic()
+    if current_monotonic - _last_user_activity_cleanup_at < 3600:
+        return
+    async with _user_activity_cleanup_lock:
+        current_monotonic = time.monotonic()
+        if current_monotonic - _last_user_activity_cleanup_at < 3600:
+            return
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=USER_ACTIVITY_RETENTION_DAYS)
+        ).isoformat()
+        await db.user_activity_logs.delete_many({"created_at": {"$lt": cutoff}})
+        _last_user_activity_cleanup_at = current_monotonic
+
+
+async def record_user_activity(
+    user: Dict[str, Any],
+    method: str,
+    path: str,
+    status_code: int,
+    duration_ms: int = 0,
+    request: Optional[Request] = None,
+    action_override: str = "",
+) -> None:
+    if not user or not user.get("id"):
+        return
+    classification = classify_activity(method, path)
+    if action_override:
+        classification = {
+            **classification,
+            "action": action_override,
+            "activity_label": classify_activity(
+                "POST",
+                f"/api/auth/{action_override}",
+            )["activity_label"],
+        }
+    await db.user_activity_logs.insert_one(
+        {
+            "id": new_id(),
+            "user_id": user["id"],
+            "user_name": str(user.get("name") or user.get("username") or "Pengguna")[:160],
+            "user_role": str(user.get("role") or "unknown")[:32],
+            **classification,
+            "method": str(method or "GET").upper()[:10],
+            "path": str(path or "")[:300],
+            "status_code": int(status_code or 0),
+            "success": 200 <= int(status_code or 0) < 400,
+            "duration_ms": max(0, int(duration_ms or 0)),
+            "client_ip": request_client_ip(request),
+            "user_agent": (
+                str(request.headers.get("user-agent") or "")[:300]
+                if request is not None
+                else ""
+            ),
+            "created_at": now_iso(),
+        }
+    )
+    await cleanup_old_user_activity_logs()
+
+
+async def safe_record_user_activity(*args: Any, **kwargs: Any) -> None:
+    try:
+        await record_user_activity(*args, **kwargs)
+    except Exception as exc:
+        logger.warning("Aktivitas pengguna gagal dicatat: %s", exc)
 
 
 def base64url_decode(value: str) -> bytes:
@@ -372,6 +507,12 @@ def public_doc(doc: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
 
 STORAGE_ROOT = ROOT_DIR / "storage" / "E-Learning Dosen"
 DEFAULT_SUBMISSION_MAX_FILE_MB = 5
+STORAGE_POLICY_TIMEZONE = ZoneInfo(os.environ.get("STORAGE_POLICY_TIMEZONE", "Asia/Jakarta"))
+STORAGE_MAINTENANCE_INTERVAL_SECONDS = max(
+    60,
+    int(os.environ.get("STORAGE_MAINTENANCE_INTERVAL_SECONDS", "300")),
+)
+_storage_maintenance_scheduler_task: Optional[asyncio.Task] = None
 
 
 def safe_path_segment(value: str) -> str:
@@ -1396,14 +1537,20 @@ async def find_user(user_id: str) -> Dict[str, Any]:
     return user
 
 
-async def get_current_user(authorization: Optional[str] = Header(None)) -> Dict[str, Any]:
+async def get_current_user(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+) -> Dict[str, Any]:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Token diperlukan")
     token = authorization.replace("Bearer ", "", 1).strip()
     session = await db.sessions.find_one({"token": token}, {"_id": 0})
     if not session:
         raise HTTPException(status_code=401, detail="Sesi tidak ditemukan")
-    return await find_user(session["user_id"])
+    user = await find_user(session["user_id"])
+    request.state.current_user = user
+    request.state.current_session = session
+    return user
 
 
 async def require_admin(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
@@ -2616,6 +2763,27 @@ def get_meet_access_token(settings: Dict[str, Any], delegated_user: str = "") ->
     return credentials.token
 
 
+def google_meet_delegation_error(exc: Exception) -> bool:
+    """Return whether Google rejected the delegated Workspace user/token grant."""
+    details = " ".join(str(item) for item in getattr(exc, "args", ()) if item)
+    message = f"{exc} {details}".lower()
+    return "unauthorized_client" in message or (
+        "invalid_grant" in message
+        and ("invalid email" in message or "not a valid email" in message)
+    )
+
+
+def google_meet_error_message(exc: Exception) -> str:
+    if google_meet_delegation_error(exc):
+        return (
+            "Google menolak delegasi akun Workspace. Pastikan Domain-wide Delegation "
+            "menggunakan Client ID numerik service account (bukan email), scope "
+            "https://www.googleapis.com/auth/meetings.space.created sudah diotorisasi, "
+            "dan akun penyelenggara adalah pengguna pada domain Google Workspace yang sama."
+        )
+    return str(exc)[:500]
+
+
 def create_google_meet_space_sync(settings: Dict[str, Any], delegated_user: str = "") -> Dict[str, str]:
     if not settings.get("service_account_configured"):
         raise RuntimeError("Service account Google belum dikonfigurasi")
@@ -2644,6 +2812,39 @@ def create_google_meet_space_sync(settings: Dict[str, Any], delegated_user: str 
     if not meeting_uri:
         raise RuntimeError("Google Meet tidak mengembalikan link pertemuan")
     return {"meeting_url": meeting_uri, "meeting_code": meeting_code, "meeting_space_name": str(payload.get("name", ""))}
+
+
+def create_google_meet_for_app_user_sync(settings: Dict[str, Any], user_email: str = "") -> Dict[str, Any]:
+    """Create a Meet as the app user, falling back to the verified default Workspace user."""
+    requested_user = str(user_email or "").strip().lower()
+    default_user = str(settings.get("google_workspace_delegated_user", "")).strip().lower()
+    organizer = requested_user or default_user
+    try:
+        meet = create_google_meet_space_sync(settings, organizer)
+        return {
+            **meet,
+            "organizer_email": organizer,
+            "organizer_fallback_used": False,
+        }
+    except Exception as exc:
+        if not (
+            default_user
+            and requested_user
+            and default_user != requested_user
+            and google_meet_delegation_error(exc)
+        ):
+            raise
+        logger.warning(
+            "Delegasi Google Meet untuk %s ditolak; memakai akun Workspace default %s",
+            requested_user,
+            default_user,
+        )
+        meet = create_google_meet_space_sync(settings, default_user)
+        return {
+            **meet,
+            "organizer_email": default_user,
+            "organizer_fallback_used": True,
+        }
 
 
 def drive_query_literal(value: str) -> str:
@@ -2908,6 +3109,53 @@ def upload_to_drive(
     return result
 
 
+def delete_drive_file_sync(file_id: str, settings: Dict[str, Any]) -> None:
+    if not file_id:
+        return
+    try:
+        get_drive_service(settings).files().delete(
+            fileId=file_id,
+            supportsAllDrives=True,
+        ).execute()
+    except Exception as exc:
+        if int(getattr(getattr(exc, "resp", None), "status", 0) or 0) == 404:
+            return
+        raise
+
+
+def download_drive_file_to_temp_sync(
+    file_id: str,
+    file_name: str,
+    settings: Dict[str, Any],
+) -> Path:
+    suffix = Path(safe_path_segment(file_name or "attachment.bin")).suffix[:20]
+    temporary = tempfile.NamedTemporaryFile(
+        prefix="nugas-drive-",
+        suffix=suffix,
+        delete=False,
+    )
+    temporary_path = Path(temporary.name)
+    try:
+        request = get_drive_service(settings).files().get_media(
+            fileId=file_id,
+            supportsAllDrives=True,
+        )
+        downloader = MediaIoBaseDownload(temporary, request)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+        temporary.close()
+        return temporary_path
+    except Exception:
+        temporary.close()
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def remove_temporary_file(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
 async def refresh_embedded_file_references(file_id: str) -> None:
     updated = await db.stored_files.find_one({"id": file_id}, {"_id": 0})
     if not updated:
@@ -2927,6 +3175,85 @@ async def refresh_embedded_file_references(file_id: str) -> None:
         {"$set": {"attachments.$[item]": public_file}},
         array_filters=[{"item.file_id": file_id}],
     )
+    await db.materials.update_many(
+        {"attachment.file_id": file_id},
+        {"$set": {"attachment": public_file, "file_url": public_file.get("file_url", "")}},
+    )
+    await db.comments.update_many(
+        {"attachment.file_id": file_id},
+        {"$set": {"attachment": public_file}},
+    )
+    await db.chat_messages.update_many(
+        {"attachment.file_id": file_id},
+        {"$set": {"attachment": public_file}},
+    )
+
+
+async def claim_drive_sync_attempt(file_id: str) -> Optional[int]:
+    """Claim one of the five daily synchronization attempts for a file."""
+    now = datetime.now(timezone.utc)
+    attempt_day = sync_attempt_day(now, STORAGE_POLICY_TIMEZONE)
+    async with _drive_sync_attempt_lock:
+        file_doc = await db.stored_files.find_one({"id": file_id}, {"_id": 0})
+        if not file_doc:
+            return None
+        previous_attempts = (
+            int(file_doc.get("drive_sync_attempts_today", 0) or 0)
+            if file_doc.get("drive_sync_attempt_date") == attempt_day
+            else 0
+        )
+        if previous_attempts >= DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY:
+            await db.stored_files.update_one(
+                {"id": file_id},
+                {
+                    "$set": {
+                        "drive_sync_status": "failed",
+                        "drive_next_retry_at": next_drive_retry_at(
+                            previous_attempts,
+                            now,
+                            STORAGE_POLICY_TIMEZONE,
+                        ),
+                        "updated_at": now_iso(),
+                    }
+                },
+            )
+            return None
+        attempts_today = previous_attempts + 1
+        await db.stored_files.update_one(
+            {"id": file_id},
+            {
+                "$set": {
+                    "drive_sync_attempt_date": attempt_day,
+                    "drive_sync_attempts_today": attempts_today,
+                    "drive_sync_attempts_total": int(file_doc.get("drive_sync_attempts_total", 0) or 0) + 1,
+                    "drive_last_attempt_at": now_iso(),
+                    "drive_next_retry_at": (now + timedelta(minutes=15)).isoformat(),
+                    "drive_sync_status": "pending",
+                    "updated_at": now_iso(),
+                }
+            },
+        )
+        return attempts_today
+
+
+async def mark_drive_sync_failure(file_id: str, error: str, attempts_today: int) -> None:
+    await db.stored_files.update_one(
+        {"id": file_id},
+        {
+            "$set": {
+                "upload_status": "drive_upload_failed",
+                "drive_sync_status": "failed",
+                "drive_error": error[:500],
+                "drive_next_retry_at": next_drive_retry_at(
+                    attempts_today,
+                    datetime.now(timezone.utc),
+                    STORAGE_POLICY_TIMEZONE,
+                ),
+                "updated_at": now_iso(),
+            }
+        },
+    )
+    await refresh_embedded_file_references(file_id)
 
 
 async def sync_stored_file_to_drive(file_id: str) -> None:
@@ -2941,6 +3268,7 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
                     "storage_provider": "google_drive",
                     "upload_status": "uploaded_to_drive",
                     "drive_sync_status": "synced",
+                    "drive_next_retry_at": "",
                     "updated_at": now_iso(),
                 },
                 "$unset": {"drive_error": ""},
@@ -2952,24 +3280,30 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
     if not google_drive_upload_enabled(settings):
         await db.stored_files.update_one(
             {"id": file_id},
-            {"$set": {"drive_sync_status": "not_configured", "updated_at": now_iso()}},
-        )
-        await refresh_embedded_file_references(file_id)
-        return
-    local_path = Path(file_doc.get("local_path", ""))
-    if not file_doc.get("local_path") or not local_path.exists():
-        await db.stored_files.update_one(
-            {"id": file_id},
             {
                 "$set": {
-                    "upload_status": "drive_upload_failed",
-                    "drive_sync_status": "failed",
-                    "drive_error": "File lokal tidak ditemukan untuk sinkron Google Drive.",
+                    "drive_sync_status": "not_configured",
+                    "drive_next_retry_at": (
+                        datetime.now(timezone.utc) + timedelta(hours=1)
+                    ).isoformat(),
                     "updated_at": now_iso(),
                 }
             },
         )
         await refresh_embedded_file_references(file_id)
+        return
+    attempts_today = await claim_drive_sync_attempt(file_id)
+    if attempts_today is None:
+        await refresh_embedded_file_references(file_id)
+        return
+    file_doc = await db.stored_files.find_one({"id": file_id}, {"_id": 0}) or file_doc
+    local_path = Path(file_doc.get("local_path", ""))
+    if not file_doc.get("local_path") or not local_path.exists():
+        await mark_drive_sync_failure(
+            file_id,
+            "File lokal tidak ditemukan untuk sinkron Google Drive.",
+            attempts_today,
+        )
         return
     try:
         drive_doc = await asyncio.to_thread(
@@ -2981,6 +3315,24 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
             settings,
             file_doc.get("lecturer_email", ""),
         )
+        if not await db.stored_files.find_one({"id": file_id}, {"_id": 0, "id": 1}):
+            orphan_doc = {
+                "id": file_id,
+                "file_name": file_doc.get("file_name", ""),
+                "drive_file_id": drive_doc.get("drive_file_id", ""),
+            }
+            try:
+                await asyncio.to_thread(
+                    delete_drive_file_sync,
+                    drive_doc.get("drive_file_id", ""),
+                    settings,
+                )
+            except Exception as delete_exc:
+                await queue_drive_file_deletion(
+                    orphan_doc,
+                    google_drive_error_message(delete_exc),
+                )
+            return
         await db.stored_files.update_one(
             {"id": file_id},
             {
@@ -2989,6 +3341,7 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
                     "storage_provider": "google_drive",
                     "upload_status": "uploaded_to_drive",
                     "drive_sync_status": "synced",
+                    "drive_next_retry_at": "",
                     "updated_at": now_iso(),
                 },
                 "$unset": {"drive_error": ""},
@@ -3014,18 +3367,7 @@ async def sync_stored_file_to_drive(file_id: str) -> None:
     except Exception as exc:
         logger.exception("Sinkron Google Drive background gagal untuk %s: %s", file_doc.get("file_name", file_id), exc)
         drive_error = google_drive_error_message(exc)
-        await db.stored_files.update_one(
-            {"id": file_id},
-            {
-                "$set": {
-                    "upload_status": "drive_upload_failed",
-                    "drive_sync_status": "failed",
-                    "drive_error": drive_error,
-                    "updated_at": now_iso(),
-                }
-            },
-        )
-        await refresh_embedded_file_references(file_id)
+        await mark_drive_sync_failure(file_id, drive_error, attempts_today)
 
 
 async def save_uploaded_file_record(
@@ -3091,6 +3433,7 @@ async def save_uploaded_file_record(
         "storage_path": storage_path,
         "storage_provider": "server_local",
         "local_path": str(local_path),
+        "local_available": True,
         "uploaded_by": uploaded_by,
         "uploaded_at": now_iso(),
         "submission_id": submission_id,
@@ -3103,6 +3446,11 @@ async def save_uploaded_file_record(
         "lecturer_folder_name": lecturer_folder,
         "upload_status": "stored_on_server",
         "drive_sync_status": "not_configured",
+        "drive_sync_attempt_date": "",
+        "drive_sync_attempts_today": 0,
+        "drive_sync_attempts_total": 0,
+        "drive_last_attempt_at": "",
+        "drive_next_retry_at": "",
         "drive_hierarchy": drive_hierarchy,
     }
 
@@ -3274,6 +3622,10 @@ def normalized_material_payload(payload: MaterialInput) -> Dict[str, Any]:
         raise HTTPException(status_code=400, detail="Link Google Meet tidak valid")
     doc["meeting_type"] = meeting_type
     doc["meeting_url"] = meeting_url if meeting_type == "online" else ""
+    try:
+        doc["video_url"] = normalize_youtube_url(str(doc.get("video_url") or ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return doc
 
 
@@ -3443,6 +3795,13 @@ async def sso_exchange(payload: SsoExchangeInput):
             "created_at": now_iso(),
         }
     )
+    await safe_record_user_activity(
+        user,
+        "POST",
+        "/api/auth/sso/exchange",
+        200,
+        action_override="login",
+    )
     return {"token": token, "user": public_doc(user)}
 
 
@@ -3461,6 +3820,13 @@ async def login(payload: LoginInput):
     token = new_id() + new_id()
     await db.sessions.insert_one({"token": token, "user_id": user["id"], "created_at": now_iso()})
     await db.users.update_one({"id": user["id"]}, {"$set": {"last_login_at": now_iso()}})
+    await safe_record_user_activity(
+        user,
+        "POST",
+        "/api/auth/login",
+        200,
+        action_override="login",
+    )
     user = public_doc(user)
     return {"token": token, "user": user}
 
@@ -3789,6 +4155,19 @@ async def logout(authorization: Optional[str] = Header(None)):
     if authorization and authorization.startswith("Bearer "):
         token = authorization.replace("Bearer ", "", 1).strip()
         session = await db.sessions.find_one_and_delete({"token": token}, {"_id": 0})
+        if session:
+            logout_user = await db.users.find_one(
+                {"id": session.get("user_id", "")},
+                {"_id": 0, "password_hash": 0},
+            )
+            if logout_user:
+                await safe_record_user_activity(
+                    logout_user,
+                    "POST",
+                    "/api/auth/logout",
+                    200,
+                    action_override="logout",
+                )
         if session and session.get("auth_source") == "sso" and oidc_settings()["enabled"]:
             try:
                 settings = oidc_require_settings()
@@ -4180,6 +4559,313 @@ async def reject_enrollment_request(request_id: str, user: Dict[str, Any] = Depe
     return updated
 
 
+def notification_excerpt(value: Any, fallback: str, limit: int = 120) -> str:
+    text = " ".join(str(value or "").split()).strip()
+    if not text:
+        return fallback
+    return text if len(text) <= limit else f"{text[: limit - 1].rstrip()}…"
+
+
+def notification_time_is_visible(value: Any, cutoff: datetime) -> bool:
+    parsed = parse_iso_datetime(str(value or ""))
+    return bool(parsed and parsed >= cutoff)
+
+
+async def notification_center_payload(
+    user: Dict[str, Any],
+    limit: int = 30,
+) -> Dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(days=NOTIFICATION_LOOKBACK_DAYS)
+    cutoff_iso = cutoff.isoformat()
+    class_ids = await lecturer_class_ids(user)
+    material_query: Dict[str, Any] = {"class_id": {"$in": class_ids}}
+    if user.get("role") == "student":
+        material_query["is_active"] = True
+    materials = await db.materials.find(
+        material_query,
+        {
+            "_id": 0,
+            "id": 1,
+            "class_id": 1,
+            "title": 1,
+            "meeting": 1,
+            "course_name": 1,
+            "class_name": 1,
+        },
+    ).to_list(5000)
+    material_map = {item["id"]: item for item in materials}
+    material_ids = list(material_map)
+    events: List[Dict[str, Any]] = []
+
+    if material_ids:
+        comments = await db.comments.find(
+            {
+                "material_id": {"$in": material_ids},
+                "author_id": {"$ne": user["id"]},
+                "created_at": {"$gte": cutoff_iso},
+            },
+            {"_id": 0},
+        ).sort("created_at", -1).to_list(1000)
+        for comment in comments:
+            material = material_map.get(comment.get("material_id", ""), {})
+            occurred_at = str(comment.get("created_at") or "")
+            is_reply = bool(comment.get("parent_id"))
+            events.append(
+                notification_event(
+                    kind="discussion",
+                    source_id=str(comment.get("id") or ""),
+                    occurred_at=occurred_at,
+                    title="Balasan diskusi baru" if is_reply else "Komentar diskusi baru",
+                    message=(
+                        f"{comment.get('author_name') or 'Pengguna'} pada "
+                        f"{material.get('title') or 'materi'}: "
+                        f"{notification_excerpt(comment.get('content'), 'Mengirim lampiran diskusi')}"
+                    ),
+                    actor_name=str(comment.get("author_name") or ""),
+                    target={
+                        "page": "courses" if user.get("role") == "student" else "materials",
+                        "object_type": "comment",
+                        "object_id": str(comment.get("id") or ""),
+                        "comment_id": str(comment.get("id") or ""),
+                        "material_id": str(comment.get("material_id") or ""),
+                        "class_id": str(material.get("class_id") or ""),
+                    },
+                )
+            )
+
+    if user.get("role") in {"admin", "lecturer"}:
+        submissions = await db.submissions.find(
+            {
+                "class_id": {"$in": class_ids},
+                "submitted_at": {"$gte": cutoff_iso},
+            },
+            {"_id": 0},
+        ).sort("submitted_at", -1).to_list(1000)
+        for submission in submissions:
+            occurred_at = str(submission.get("submitted_at") or "")
+            events.append(
+                notification_event(
+                    kind="submission",
+                    source_id=str(submission.get("id") or ""),
+                    occurred_at=occurred_at,
+                    title="Submission tugas baru",
+                    message=(
+                        f"{submission.get('student_name') or 'Mahasiswa'} mengumpulkan "
+                        f"{submission.get('assignment_title') or 'tugas'}"
+                    ),
+                    actor_name=str(submission.get("student_name") or ""),
+                    target={
+                        "page": "grading",
+                        "object_type": "submission",
+                        "object_id": str(submission.get("id") or ""),
+                        "submission_id": str(submission.get("id") or ""),
+                        "assignment_id": str(submission.get("assignment_id") or ""),
+                        "class_id": str(submission.get("class_id") or ""),
+                    },
+                )
+            )
+        enrollments = await db.enrollment_requests.find(
+            {
+                "class_id": {"$in": class_ids},
+                "status": "pending",
+                "requested_at": {"$gte": cutoff_iso},
+            },
+            {"_id": 0},
+        ).sort("requested_at", -1).to_list(1000)
+        for enrollment in enrollments:
+            occurred_at = str(enrollment.get("requested_at") or "")
+            events.append(
+                notification_event(
+                    kind="enrollment",
+                    source_id=str(enrollment.get("id") or ""),
+                    occurred_at=occurred_at,
+                    title="Permintaan masuk kelas",
+                    message=(
+                        f"{enrollment.get('student_name') or 'Mahasiswa'} meminta masuk "
+                        f"{enrollment.get('class_name') or 'kelas'}"
+                    ),
+                    actor_name=str(enrollment.get("student_name") or ""),
+                    target={
+                        "page": "students",
+                        "object_type": "enrollment",
+                        "object_id": str(enrollment.get("id") or ""),
+                        "request_id": str(enrollment.get("id") or ""),
+                        "class_id": str(enrollment.get("class_id") or ""),
+                    },
+                )
+            )
+    else:
+        assignments = await db.assignments.find(
+            {
+                "class_id": {"$in": class_ids},
+                "is_active": True,
+            },
+            {"_id": 0},
+        ).to_list(2000)
+        for assignment in assignments:
+            occurred_at = str(
+                assignment.get("published_notification_sent_at")
+                or assignment.get("published_at")
+                or assignment.get("created_at")
+                or ""
+            )
+            if (
+                not assignment_is_published(assignment, now)
+                or not notification_time_is_visible(occurred_at, cutoff)
+            ):
+                continue
+            events.append(
+                notification_event(
+                    kind="assignment",
+                    source_id=str(assignment.get("id") or ""),
+                    occurred_at=occurred_at,
+                    title="Tugas baru tersedia",
+                    message=(
+                        f"{assignment.get('title') or 'Tugas'} · "
+                        f"{assignment.get('course_name') or assignment.get('class_name') or 'Kelas'}"
+                    ),
+                    actor_name=str(assignment.get("lecturer_name") or ""),
+                    target={
+                        "page": "assignments",
+                        "object_type": "assignment",
+                        "object_id": str(assignment.get("id") or ""),
+                        "assignment_id": str(assignment.get("id") or ""),
+                        "class_id": str(assignment.get("class_id") or ""),
+                    },
+                )
+            )
+        submissions = await db.submissions.find(
+            {"student_id": user["id"]},
+            {"_id": 0},
+        ).to_list(2000)
+        for submission in submissions:
+            graded_at = str(submission.get("graded_at") or "")
+            if notification_time_is_visible(graded_at, cutoff):
+                events.append(
+                    notification_event(
+                        kind="grade",
+                        source_id=str(submission.get("id") or ""),
+                        occurred_at=graded_at,
+                        title="Nilai dan feedback tersedia",
+                        message=(
+                            f"{submission.get('assignment_title') or 'Tugas'} mendapat nilai "
+                            f"{submission.get('grade') if submission.get('grade') is not None else '-'}"
+                        ),
+                        actor_name=str(submission.get("lecturer_name") or ""),
+                        target={
+                            "page": "assignments",
+                            "object_type": "assignment",
+                            "object_id": str(submission.get("assignment_id") or ""),
+                            "assignment_id": str(submission.get("assignment_id") or ""),
+                            "submission_id": str(submission.get("id") or ""),
+                            "class_id": str(submission.get("class_id") or ""),
+                        },
+                    )
+                )
+            revision_at = str(submission.get("revision_requested_at") or "")
+            if notification_time_is_visible(revision_at, cutoff):
+                events.append(
+                    notification_event(
+                        kind="revision",
+                        source_id=str(submission.get("id") or ""),
+                        occurred_at=revision_at,
+                        title="Revisi tugas diminta",
+                        message=(
+                            f"{submission.get('assignment_title') or 'Tugas'}: "
+                            f"{notification_excerpt(submission.get('revision_note'), 'Periksa arahan revisi dosen')}"
+                        ),
+                        actor_name=str(submission.get("lecturer_name") or ""),
+                        target={
+                            "page": "assignments",
+                            "object_type": "assignment",
+                            "object_id": str(submission.get("assignment_id") or ""),
+                            "assignment_id": str(submission.get("assignment_id") or ""),
+                            "submission_id": str(submission.get("id") or ""),
+                            "class_id": str(submission.get("class_id") or ""),
+                        },
+                    )
+                )
+
+    event_ids = list({item["id"] for item in events})
+    read_receipts = (
+        await db.notification_reads.find(
+            {
+                "user_id": user["id"],
+                "notification_id": {"$in": event_ids},
+            },
+            {"_id": 0},
+        ).to_list(max(100, len(event_ids)))
+        if event_ids
+        else []
+    )
+    payload = finalize_notifications(events, read_receipts, limit)
+    payload["lookback_days"] = NOTIFICATION_LOOKBACK_DAYS
+    return payload
+
+
+@api_router.get("/notifications")
+async def list_notifications(
+    limit: int = 30,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    return await notification_center_payload(user, limit)
+
+
+@api_router.post("/notifications/{notification_id}/read")
+async def mark_notification_read(
+    notification_id: str,
+    user: Dict[str, Any] = Depends(get_current_user),
+):
+    clean_id = str(notification_id or "").strip().lower()
+    if not re.fullmatch(r"[a-f0-9]{32}", clean_id):
+        raise HTTPException(status_code=400, detail="ID notifikasi tidak valid")
+    read_at = now_iso()
+    await db.notification_reads.update_one(
+        {"user_id": user["id"], "notification_id": clean_id},
+        {
+            "$set": {
+                "id": f"{user['id']}:{clean_id}",
+                "user_id": user["id"],
+                "notification_id": clean_id,
+                "read_at": read_at,
+            }
+        },
+        upsert=True,
+    )
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(days=NOTIFICATION_READ_RETENTION_DAYS)
+    ).isoformat()
+    await db.notification_reads.delete_many({"read_at": {"$lt": cutoff}})
+    return {"ok": True, "notification_id": clean_id, "read_at": read_at}
+
+
+async def user_activity_dashboard_payload(days: int = 14) -> Dict[str, Any]:
+    safe_days = max(7, min(int(days or 14), 90))
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(days=safe_days + 1)).isoformat()
+    logs = await db.user_activity_logs.find(
+        {"created_at": {"$gte": cutoff}},
+        {"_id": 0},
+    ).sort("created_at", -1).to_list(50000)
+    payload = aggregate_user_activity(
+        logs,
+        safe_days,
+        now,
+        USER_ACTIVITY_TIMEZONE,
+    )
+    payload["retention_days"] = USER_ACTIVITY_RETENTION_DAYS
+    return payload
+
+
+@api_router.get("/user-activity")
+async def get_user_activity(
+    days: int = 14,
+    _: Dict[str, Any] = Depends(require_campus_admin),
+):
+    return await user_activity_dashboard_payload(days)
+
+
 @api_router.get("/dashboard")
 async def dashboard(user: Dict[str, Any] = Depends(require_admin)):
     class_ids = await lecturer_class_ids(user)
@@ -4218,6 +4904,11 @@ async def dashboard(user: Dict[str, Any] = Depends(require_admin)):
     avg_grade = round(sum(avg_grade_values) / len(avg_grade_values), 1) if avg_grade_values else 0
     progress_map = await calculate_student_progress_many([s["id"] for s in students], class_ids)
     risk_high = sum(1 for p in progress_map.values() if p.get("risk_label") == "Risiko Tinggi")
+    user_activity = (
+        await user_activity_dashboard_payload(14)
+        if is_campus_admin(user)
+        else None
+    )
     return {
         "summary": {
             "active_courses": active_courses_count,
@@ -4232,6 +4923,7 @@ async def dashboard(user: Dict[str, Any] = Depends(require_admin)):
             **await storage_status_summary(),
         },
         "latest_comments": comments,
+        "user_activity": user_activity,
     }
 
 
@@ -4271,18 +4963,254 @@ CLEAN_DATA_MODULES = {
 }
 
 
+def remove_local_stored_file(local_path: str) -> bool:
+    if not local_path:
+        return False
+    path = Path(local_path).resolve()
+    storage_root = STORAGE_ROOT.resolve()
+    if storage_root not in path.parents:
+        raise ValueError(f"Path file di luar storage root: {path}")
+    existed = path.exists()
+    path.unlink(missing_ok=True)
+    parent = path.parent
+    while parent != storage_root and storage_root in parent.parents:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
+    return existed
+
+
+async def queue_drive_file_deletion(file_doc: Dict[str, Any], error: str = "") -> None:
+    drive_file_id = str(file_doc.get("drive_file_id") or "").strip()
+    if not drive_file_id:
+        return
+    existing = await db.drive_delete_queue.find_one({"id": drive_file_id}, {"_id": 0}) or {}
+    await db.drive_delete_queue.update_one(
+        {"id": drive_file_id},
+        {
+            "$set": {
+                "id": drive_file_id,
+                "drive_file_id": drive_file_id,
+                "file_name": file_doc.get("file_name", ""),
+                "source_file_id": file_doc.get("id", ""),
+                "status": "pending",
+                "last_error": error[:500],
+                "next_retry_at": "",
+                "updated_at": now_iso(),
+                "created_at": existing.get("created_at", now_iso()),
+                "attempt_date": existing.get("attempt_date", ""),
+                "attempts_today": int(existing.get("attempts_today", 0) or 0),
+                "attempts_total": int(existing.get("attempts_total", 0) or 0),
+            },
+        },
+        upsert=True,
+    )
+
+
 async def delete_stored_files(query: Dict[str, Any]) -> int:
-    files = await db.stored_files.find(query, {"_id": 0, "id": 1, "local_path": 1}).to_list(5000)
+    files = await db.stored_files.find(
+        query,
+        {
+            "_id": 0,
+            "id": 1,
+            "file_name": 1,
+            "local_path": 1,
+            "drive_file_id": 1,
+        },
+    ).to_list(5000)
+    drive_files = [item for item in files if item.get("drive_file_id")]
+    drive_settings = await get_google_drive_settings(mask=False) if drive_files else {}
     for file_doc in files:
-        local_path = file_doc.get("local_path")
+        drive_file_id = str(file_doc.get("drive_file_id") or "").strip()
+        if drive_file_id:
+            if google_drive_upload_enabled(drive_settings):
+                try:
+                    await asyncio.to_thread(
+                        delete_drive_file_sync,
+                        drive_file_id,
+                        drive_settings,
+                    )
+                    await db.drive_delete_queue.delete_one({"id": drive_file_id})
+                except Exception as exc:
+                    logger.warning(
+                        "Penghapusan file Drive %s ditunda: %s",
+                        drive_file_id,
+                        exc,
+                    )
+                    await queue_drive_file_deletion(file_doc, google_drive_error_message(exc))
+            else:
+                await queue_drive_file_deletion(
+                    file_doc,
+                    "Google Drive belum aktif saat file lokal dihapus.",
+                )
+        local_path = str(file_doc.get("local_path") or "")
         if local_path:
             try:
-                Path(local_path).unlink(missing_ok=True)
+                remove_local_stored_file(local_path)
             except Exception as exc:
                 logger.warning("Gagal menghapus file lokal %s: %s", local_path, exc)
     if files:
         await db.stored_files.delete_many({"id": {"$in": [item["id"] for item in files]}})
     return len(files)
+
+
+async def process_drive_delete_queue(limit: int = 100) -> int:
+    settings = await get_google_drive_settings(mask=False)
+    if not google_drive_upload_enabled(settings):
+        return 0
+    now = datetime.now(timezone.utc)
+    today = sync_attempt_day(now, STORAGE_POLICY_TIMEZONE)
+    processed = 0
+    items = await db.drive_delete_queue.find(
+        {"status": {"$in": ["pending", "failed"]}},
+        {"_id": 0},
+    ).sort("created_at", 1).to_list(limit)
+    for item in items:
+        if not retry_is_due(str(item.get("next_retry_at") or ""), now):
+            continue
+        attempts_today = (
+            int(item.get("attempts_today", 0) or 0)
+            if item.get("attempt_date") == today
+            else 0
+        )
+        if attempts_today >= DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY:
+            await db.drive_delete_queue.update_one(
+                {"id": item["id"]},
+                {
+                    "$set": {
+                        "next_retry_at": next_drive_retry_at(
+                            attempts_today,
+                            now,
+                            STORAGE_POLICY_TIMEZONE,
+                        ),
+                        "updated_at": now_iso(),
+                    }
+                },
+            )
+            continue
+        attempts_today += 1
+        try:
+            await asyncio.to_thread(
+                delete_drive_file_sync,
+                item.get("drive_file_id", ""),
+                settings,
+            )
+            await db.drive_delete_queue.delete_one({"id": item["id"]})
+            processed += 1
+        except Exception as exc:
+            await db.drive_delete_queue.update_one(
+                {"id": item["id"]},
+                {
+                    "$set": {
+                        "status": "failed",
+                        "attempt_date": today,
+                        "attempts_today": attempts_today,
+                        "attempts_total": int(item.get("attempts_total", 0) or 0) + 1,
+                        "last_error": google_drive_error_message(exc),
+                        "last_attempt_at": now_iso(),
+                        "next_retry_at": next_drive_retry_at(
+                            attempts_today,
+                            now,
+                            STORAGE_POLICY_TIMEZONE,
+                        ),
+                        "updated_at": now_iso(),
+                    }
+                },
+            )
+    return processed
+
+
+async def retry_due_drive_syncs(limit: int = 100) -> int:
+    now = datetime.now(timezone.utc)
+    files = await db.stored_files.find(
+        {"drive_sync_status": {"$in": ["pending", "failed", "not_configured"]}},
+        {"_id": 0, "id": 1, "drive_next_retry_at": 1},
+    ).sort("uploaded_at", 1).to_list(limit)
+    attempted = 0
+    for file_doc in files:
+        if not retry_is_due(str(file_doc.get("drive_next_retry_at") or ""), now):
+            continue
+        await sync_stored_file_to_drive(file_doc["id"])
+        attempted += 1
+    return attempted
+
+
+async def purge_expired_synced_local_files(limit: int = 500) -> int:
+    now = datetime.now(timezone.utc)
+    files = await db.stored_files.find(
+        {
+            "drive_sync_status": "synced",
+            "drive_file_id": {"$ne": ""},
+            "local_path": {"$ne": ""},
+        },
+        {
+            "_id": 0,
+            "id": 1,
+            "local_path": 1,
+            "drive_uploaded_at": 1,
+            "updated_at": 1,
+            "uploaded_at": 1,
+        },
+    ).sort("drive_uploaded_at", 1).to_list(limit)
+    purged = 0
+    for file_doc in files:
+        synced_at = (
+            file_doc.get("drive_uploaded_at")
+            or file_doc.get("updated_at")
+            or file_doc.get("uploaded_at")
+            or ""
+        )
+        if not local_copy_is_expired(
+            str(synced_at),
+            now,
+            DRIVE_LOCAL_RETENTION_DAYS,
+        ):
+            continue
+        try:
+            remove_local_stored_file(str(file_doc.get("local_path") or ""))
+        except Exception as exc:
+            logger.warning(
+                "Retensi gagal menghapus file lokal %s: %s",
+                file_doc.get("id", ""),
+                exc,
+            )
+            continue
+        await db.stored_files.update_one(
+            {"id": file_doc["id"]},
+            {
+                "$set": {
+                    "local_path": "",
+                    "local_available": False,
+                    "local_purged_at": now_iso(),
+                    "local_retention_days": DRIVE_LOCAL_RETENTION_DAYS,
+                    "updated_at": now_iso(),
+                }
+            },
+        )
+        await refresh_embedded_file_references(file_doc["id"])
+        purged += 1
+    return purged
+
+
+async def run_storage_maintenance_once() -> Dict[str, int]:
+    return {
+        "drive_deletions": await process_drive_delete_queue(),
+        "drive_sync_attempts": await retry_due_drive_syncs(),
+        "local_files_purged": await purge_expired_synced_local_files(),
+    }
+
+
+async def storage_maintenance_scheduler() -> None:
+    while True:
+        try:
+            await run_storage_maintenance_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Scheduler pemeliharaan file bermasalah: %s", exc)
+        await asyncio.sleep(STORAGE_MAINTENANCE_INTERVAL_SECONDS)
 
 
 async def clean_data_module_counts() -> Dict[str, int]:
@@ -4325,6 +5253,7 @@ async def clean_data_module_counts() -> Dict[str, int]:
             + await db.email_messages.count_documents({})
             + await db.password_reset_requests.count_documents({})
             + await db.password_reset_otps.count_documents({})
+            + await db.notification_reads.count_documents({})
         ),
     }
 
@@ -4390,6 +5319,7 @@ async def execute_clean_data_module(module: str) -> Dict[str, Any]:
         affected["email_messages"] = deleted_count(await db.email_messages.delete_many({}))
         affected["password_reset_requests"] = deleted_count(await db.password_reset_requests.delete_many({}))
         affected["password_reset_otps"] = deleted_count(await db.password_reset_otps.delete_many({}))
+        affected["notification_reads"] = deleted_count(await db.notification_reads.delete_many({}))
 
     elif module == "students":
         student_ids = [
@@ -4398,6 +5328,7 @@ async def execute_clean_data_module(module: str) -> Dict[str, Any]:
         ]
         student_query = {"$in": student_ids} if student_ids else {"$in": ["__none__"]}
         affected["student_sessions"] = deleted_count(await db.sessions.delete_many({"user_id": student_query}))
+        affected["notification_reads"] = deleted_count(await db.notification_reads.delete_many({"user_id": student_query}))
         affected["student_users"] = deleted_count(await db.users.delete_many({"role": "student"}))
         affected["class_memberships_reset"] = modified_count(await db.classes.update_many({}, {"$set": {"student_ids": []}}))
         affected["enrollment_requests"] = deleted_count(await db.enrollment_requests.delete_many({}))
@@ -4445,24 +5376,43 @@ async def clean_data(module: str, payload: CleanDataInput, _: Dict[str, Any] = D
 async def storage_status(_: Dict[str, Any] = Depends(require_campus_admin)):
     return {
         **await storage_status_summary(),
+        "policy": {
+            "local_retention_days_after_drive_sync": DRIVE_LOCAL_RETENTION_DAYS,
+            "max_drive_sync_attempts_per_day": DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY,
+            "timezone": str(STORAGE_POLICY_TIMEZONE),
+        },
         "files": {
             "total": await db.stored_files.count_documents({}),
             "google_drive": await db.stored_files.count_documents({"storage_provider": "google_drive"}),
             "server_local": await db.stored_files.count_documents({"storage_provider": "server_local"}),
             "drive_pending": await db.stored_files.count_documents({"drive_sync_status": "pending"}),
             "drive_failed": await db.stored_files.count_documents({"drive_sync_status": "failed"}),
+            "local_purged": await db.stored_files.count_documents(
+                {"drive_sync_status": "synced", "local_available": False}
+            ),
+            "drive_delete_pending": await db.drive_delete_queue.count_documents({}),
         },
     }
 
 
 async def drive_sync_overview(limit: int = 50) -> Dict[str, Any]:
-    query = {"record_type": {"$in": ["submission", "assignment_attachment"]}}
+    query = {
+        "record_type": {
+            "$in": ["submission", "assignment_attachment", "material_attachment"]
+        }
+    }
     summary = {
         "total": await db.stored_files.count_documents(query),
         "pending": await db.stored_files.count_documents({**query, "drive_sync_status": "pending"}),
         "synced": await db.stored_files.count_documents({**query, "drive_sync_status": "synced"}),
         "failed": await db.stored_files.count_documents({**query, "drive_sync_status": "failed"}),
         "not_configured": await db.stored_files.count_documents({**query, "drive_sync_status": "not_configured"}),
+        "local_purged": await db.stored_files.count_documents(
+            {**query, "drive_sync_status": "synced", "local_available": False}
+        ),
+        "drive_delete_pending": await db.drive_delete_queue.count_documents({}),
+        "local_retention_days": DRIVE_LOCAL_RETENTION_DAYS,
+        "max_attempts_per_day": DRIVE_SYNC_MAX_ATTEMPTS_PER_DAY,
     }
     files = await db.stored_files.find(query, {"_id": 0}).sort("uploaded_at", -1).to_list(limit)
     submission_ids = [item.get("submission_id") for item in files if item.get("submission_id")]
@@ -4486,6 +5436,13 @@ async def drive_sync_overview(limit: int = 50) -> Dict[str, Any]:
                 "drive_sync_status": item.get("drive_sync_status", ""),
                 "drive_error": item.get("drive_error", ""),
                 "drive_file_url": item.get("drive_file_url", ""),
+                "drive_sync_attempt_date": item.get("drive_sync_attempt_date", ""),
+                "drive_sync_attempts_today": item.get("drive_sync_attempts_today", 0),
+                "drive_sync_attempts_total": item.get("drive_sync_attempts_total", 0),
+                "drive_last_attempt_at": item.get("drive_last_attempt_at", ""),
+                "drive_next_retry_at": item.get("drive_next_retry_at", ""),
+                "local_available": item.get("local_available", bool(item.get("local_path"))),
+                "local_purged_at": item.get("local_purged_at", ""),
                 "uploaded_at": item.get("uploaded_at", ""),
                 "updated_at": item.get("updated_at", ""),
                 "assignment_id": item.get("assignment_id", ""),
@@ -4708,7 +5665,7 @@ async def test_google_meet_settings(_: Dict[str, Any] = Depends(require_campus_a
         meet = await asyncio.to_thread(create_google_meet_space_sync, settings, delegated_user)
     except Exception as exc:
         logger.warning("Tes koneksi Google Meet gagal: %s", exc)
-        raise HTTPException(status_code=400, detail=str(exc)[:500]) from exc
+        raise HTTPException(status_code=400, detail=google_meet_error_message(exc)) from exc
     return {
         "ok": True,
         "message": "Koneksi Google Meet berhasil dan ruang uji telah dibuat",
@@ -5403,10 +6360,10 @@ async def generate_material_google_meet(payload: GoogleMeetInput, user: Dict[str
     if not settings.get("google_meet_enabled"):
         raise HTTPException(status_code=503, detail="Google Meet belum diaktifkan oleh Admin Kampus")
     try:
-        meet = await asyncio.to_thread(create_google_meet_space_sync, settings, user.get("email", ""))
+        meet = await asyncio.to_thread(create_google_meet_for_app_user_sync, settings, user.get("email", ""))
     except Exception as exc:
         logger.warning("Pembuatan Google Meet gagal: %s", exc)
-        raise HTTPException(status_code=503, detail=str(exc)[:500]) from exc
+        raise HTTPException(status_code=503, detail=google_meet_error_message(exc)) from exc
     return {"ok": True, **meet}
 
 
@@ -6042,7 +6999,11 @@ async def send_chat_message(
     return response
 
 
-async def stored_file_context(file_id: str, token: str = "", authorization: Optional[str] = Header(None)) -> tuple[Dict[str, Any], Dict[str, Any], Path]:
+async def stored_file_context(
+    file_id: str,
+    token: str = "",
+    authorization: Optional[str] = Header(None),
+) -> tuple[Dict[str, Any], Dict[str, Any], Path, bool]:
     auth_token = token.strip()
     if not auth_token and authorization and authorization.startswith("Bearer "):
         auth_token = authorization.replace("Bearer ", "", 1).strip()
@@ -6086,71 +7047,102 @@ async def stored_file_context(file_id: str, token: str = "", authorization: Opti
             academic_class_id = assignment.get("class_id", "")
         if academic_class_id:
             await require_class_access(academic_class_id, user)
-    local_path = file_doc.get("local_path", "")
-    if not local_path:
-        raise HTTPException(status_code=404, detail="File lokal belum tersedia")
-    path = Path(local_path).resolve()
-    storage_root = STORAGE_ROOT.resolve()
-    if storage_root not in path.parents:
-        raise HTTPException(status_code=403, detail="Path file tidak valid")
-    if not path.exists() or not path.is_file():
-        raise HTTPException(status_code=404, detail="File tidak ada di server")
-    return user, file_doc, path
+    local_path = str(file_doc.get("local_path") or "")
+    if local_path:
+        path = Path(local_path).resolve()
+        storage_root = STORAGE_ROOT.resolve()
+        if storage_root not in path.parents:
+            raise HTTPException(status_code=403, detail="Path file tidak valid")
+        if path.exists() and path.is_file():
+            return user, file_doc, path, False
+    drive_file_id = str(file_doc.get("drive_file_id") or "").strip()
+    if drive_file_id:
+        settings = await get_google_drive_settings(mask=False)
+        if not google_drive_upload_enabled(settings):
+            raise HTTPException(
+                status_code=503,
+                detail="Salinan lokal sudah tidak tersedia dan Google Drive belum aktif.",
+            )
+        try:
+            path = await asyncio.to_thread(
+                download_drive_file_to_temp_sync,
+                drive_file_id,
+                file_doc.get("file_name", ""),
+                settings,
+            )
+        except Exception as exc:
+            logger.warning("File %s gagal dibaca dari Google Drive: %s", file_id, exc)
+            raise HTTPException(
+                status_code=503,
+                detail=f"File gagal diambil dari Google Drive: {google_drive_error_message(exc)}",
+            ) from exc
+        return user, file_doc, path, True
+    raise HTTPException(status_code=404, detail="File tidak tersedia di server atau Google Drive")
 
 
 @api_router.get("/files/{file_id}/download")
 async def download_stored_file(file_id: str, token: str = "", authorization: Optional[str] = Header(None)):
-    _, file_doc, path = await stored_file_context(file_id, token, authorization)
-    return FileResponse(path, media_type=file_doc.get("mime_type") or "application/octet-stream", filename=file_doc.get("file_name") or path.name)
+    _, file_doc, path, temporary = await stored_file_context(file_id, token, authorization)
+    return FileResponse(
+        path,
+        media_type=file_doc.get("mime_type") or "application/octet-stream",
+        filename=file_doc.get("file_name") or path.name,
+        background=BackgroundTask(remove_temporary_file, path) if temporary else None,
+    )
 
 
 @api_router.get("/files/{file_id}/inline")
 async def inline_stored_file(file_id: str, token: str = "", authorization: Optional[str] = Header(None)):
-    _, file_doc, path = await stored_file_context(file_id, token, authorization)
+    _, file_doc, path, temporary = await stored_file_context(file_id, token, authorization)
     return FileResponse(
         path,
         media_type=file_doc.get("mime_type") or "application/octet-stream",
         filename=file_doc.get("file_name") or path.name,
         content_disposition_type="inline",
+        background=BackgroundTask(remove_temporary_file, path) if temporary else None,
     )
 
 
 @api_router.get("/files/{file_id}/preview")
 async def preview_stored_file(file_id: str, token: str = "", authorization: Optional[str] = Header(None)):
-    _, file_doc, path = await stored_file_context(file_id, token, authorization)
-    kind = preview_kind(file_doc, path)
-    response: Dict[str, Any] = {
-        "id": file_id,
-        "file_name": file_doc.get("file_name") or path.name,
-        "mime_type": file_doc.get("mime_type") or "application/octet-stream",
-        "size": file_doc.get("size", 0),
-        "kind": kind,
-        **local_file_urls(file_id),
-    }
-    if kind in {"pdf", "image"}:
-        response["render"] = "inline"
-        return response
+    _, file_doc, path, temporary = await stored_file_context(file_id, token, authorization)
     try:
-        if kind == "docx":
-            response.update({"render": "html", "html": preview_docx_html(path)})
-            return response
-        if kind == "xlsx":
-            response.update({"render": "html", "html": preview_xlsx_html(path)})
-            return response
-        if kind == "text":
-            response.update({"render": "html", "html": preview_text_html(path)})
-            return response
-    except Exception as exc:
-        logger.warning("Preview dokumen gagal untuk %s: %s", file_id, exc)
-        response.update({"render": "unsupported", "message": "Preview dokumen gagal dibaca. File mungkin rusak atau formatnya tidak valid."})
-        return response
-    response.update(
-        {
-            "render": "unsupported",
-            "message": "Format file ini belum bisa dipreview langsung. Gunakan file PDF, DOCX, XLSX, TXT, CSV, atau gambar.",
+        kind = preview_kind(file_doc, path)
+        response: Dict[str, Any] = {
+            "id": file_id,
+            "file_name": file_doc.get("file_name") or path.name,
+            "mime_type": file_doc.get("mime_type") or "application/octet-stream",
+            "size": file_doc.get("size", 0),
+            "kind": kind,
+            **local_file_urls(file_id),
         }
-    )
-    return response
+        if kind in {"pdf", "image"}:
+            response["render"] = "inline"
+            return response
+        try:
+            if kind == "docx":
+                response.update({"render": "html", "html": preview_docx_html(path)})
+                return response
+            if kind == "xlsx":
+                response.update({"render": "html", "html": preview_xlsx_html(path)})
+                return response
+            if kind == "text":
+                response.update({"render": "html", "html": preview_text_html(path)})
+                return response
+        except Exception as exc:
+            logger.warning("Preview dokumen gagal untuk %s: %s", file_id, exc)
+            response.update({"render": "unsupported", "message": "Preview dokumen gagal dibaca. File mungkin rusak atau formatnya tidak valid."})
+            return response
+        response.update(
+            {
+                "render": "unsupported",
+                "message": "Format file ini belum bisa dipreview langsung. Gunakan file PDF, DOCX, XLSX, TXT, CSV, atau gambar.",
+            }
+        )
+        return response
+    finally:
+        if temporary:
+            remove_temporary_file(path)
 
 
 @api_router.post("/assignments/{assignment_id}/submit")
@@ -6207,6 +7199,18 @@ async def submit_assignment(
         assignment.get("title", "Tugas"),
     ]
     submission_id = submission["id"] if submission else new_id()
+    previous_file_ids: List[str] = []
+    if submission:
+        previous_files = submission.get("files") if isinstance(submission.get("files"), list) else []
+        if isinstance(submission.get("file"), dict):
+            previous_files = [*previous_files, submission["file"]]
+        previous_file_ids = list(
+            {
+                str(item.get("file_id") or item.get("id") or "")
+                for item in previous_files
+                if isinstance(item, dict) and (item.get("file_id") or item.get("id"))
+            }
+        )
     saved_files = []
     for upload in upload_files:
         file_doc = await save_uploaded_file_record(
@@ -6252,6 +7256,13 @@ async def submit_assignment(
         "grade_history": submission.get("grade_history", []) if submission else [],
     }
     await db.submissions.update_one({"id": submission_id}, {"$set": doc}, upsert=True)
+    if previous_file_ids:
+        await delete_stored_files(
+            {
+                "id": {"$in": previous_file_ids},
+                "record_type": "submission",
+            }
+        )
     await db.reminder_logs.insert_one(
         {
             "id": new_id(),
@@ -7049,6 +8060,44 @@ async def chat_websocket(websocket: WebSocket, token: str = ""):
         await chat_connections.disconnect(user["id"], websocket)
 
 
+@app.middleware("http")
+async def user_activity_logging_middleware(request: Request, call_next):
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        user = getattr(request.state, "current_user", None)
+        if (
+            user
+            and request.url.path.startswith("/api/")
+            and should_log_user_activity(request.method, request.url.path)
+        ):
+            await safe_record_user_activity(
+                user,
+                request.method,
+                request.url.path,
+                500,
+                round((time.perf_counter() - started_at) * 1000),
+                request,
+            )
+        raise
+    user = getattr(request.state, "current_user", None)
+    if (
+        user
+        and request.url.path.startswith("/api/")
+        and should_log_user_activity(request.method, request.url.path)
+    ):
+        await safe_record_user_activity(
+            user,
+            request.method,
+            request.url.path,
+            response.status_code,
+            round((time.perf_counter() - started_at) * 1000),
+            request,
+        )
+    return response
+
+
 app.include_router(api_router)
 
 app.add_middleware(
@@ -7063,7 +8112,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 @app.on_event("startup")
 async def on_startup():
-    global _database_backup_scheduler_task
+    global _database_backup_scheduler_task, _storage_maintenance_scheduler_task
     await db.connect()
     await seed_data()
     await load_oidc_runtime_settings()
@@ -7090,6 +8139,15 @@ async def on_startup():
     await db.users.create_index("name")
     await db.users.create_index([("sso_issuer", 1), ("sso_subject", 1)], unique=True, sparse=True)
     await db.sessions.create_index("token", unique=True)
+    await db.user_activity_logs.create_index("created_at")
+    await db.user_activity_logs.create_index("user_id")
+    await db.user_activity_logs.create_index("category")
+    await db.user_activity_logs.create_index("action")
+    await db.notification_reads.create_index(
+        [("user_id", 1), ("notification_id", 1)],
+        unique=True,
+    )
+    await db.notification_reads.create_index("read_at")
     await db.database_backups.create_index("created_at")
     await db.oidc_flows.create_index("state_hash", unique=True)
     await db.oidc_flows.create_index("expires_at", expireAfterSeconds=0)
@@ -7117,6 +8175,9 @@ async def on_startup():
     await db.stored_files.create_index("record_type")
     await db.stored_files.create_index("lecturer_id")
     await db.stored_files.create_index("uploaded_at")
+    await db.stored_files.create_index("drive_next_retry_at")
+    await db.drive_delete_queue.create_index("status")
+    await db.drive_delete_queue.create_index("next_retry_at")
     await db.comments.create_index("material_id")
     await db.comments.create_index("created_at")
     await db.enrollment_requests.create_index([("class_id", 1), ("student_id", 1)])
@@ -7126,12 +8187,24 @@ async def on_startup():
     await db.whatsapp_messages.create_index("status")
     await db.whatsapp_messages.create_index("created_at")
     await db.password_reset_requests.create_index("requested_at")
+    try:
+        await cleanup_old_user_activity_logs()
+    except Exception as exc:
+        logger.warning("Retensi log aktivitas belum dapat dijalankan: %s", exc)
     _database_backup_scheduler_task = asyncio.create_task(database_backup_scheduler())
+    _storage_maintenance_scheduler_task = asyncio.create_task(storage_maintenance_scheduler())
 
 
 @app.on_event("shutdown")
 async def on_shutdown():
-    global _database_backup_scheduler_task
+    global _database_backup_scheduler_task, _storage_maintenance_scheduler_task
+    if _storage_maintenance_scheduler_task:
+        _storage_maintenance_scheduler_task.cancel()
+        try:
+            await _storage_maintenance_scheduler_task
+        except asyncio.CancelledError:
+            pass
+        _storage_maintenance_scheduler_task = None
     if _database_backup_scheduler_task:
         _database_backup_scheduler_task.cancel()
         try:

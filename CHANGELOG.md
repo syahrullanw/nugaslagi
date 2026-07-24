@@ -6,6 +6,39 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.1.0] — 2026-07-24
+
+### Google Meet dan Google Drive
+
+- Memperbaiki pembuatan ruang Google Meet ketika delegasi akun dosen ditolak dengan mencoba akun Workspace default yang telah diverifikasi.
+- Mengubah pesan `unauthorized_client` menjadi petunjuk konfigurasi Domain-wide Delegation yang dapat ditindaklanjuti, termasuk Client ID numerik, scope Meet, dan domain akun penyelenggara.
+- Menambahkan monitor sinkronisasi file Google Drive beserta status, jumlah percobaan, jadwal percobaan berikutnya, tautan file Drive, serta aksi retry manual.
+- Menambahkan scheduler pemeliharaan yang terus mencoba sinkronisasi gagal maksimal lima kali per hari dan melanjutkannya kembali pada hari berikutnya.
+- Menghapus salinan lokal file yang telah berhasil tersinkron ke Google Drive setelah 14 hari tanpa menghapus file di Drive atau referensi lampirannya.
+- Memperbaiki konsistensi referensi file pada materi, tugas, submission, diskusi, dan chat setelah status penyimpanan berubah.
+
+### Audit aktivitas dan notifikasi
+
+- Menambahkan pencatatan aktivitas pengguna untuk login dan permintaan API terautentikasi, termasuk peran, kategori, status keberhasilan, durasi, serta retensi log yang dapat dikonfigurasi.
+- Menambahkan grafik tren aktivitas, ringkasan pengguna aktif, login, kegagalan, dan daftar aktivitas terbaru pada dashboard admin kampus.
+- Menambahkan pusat notifikasi pada header admin/dosen dan mahasiswa untuk komentar atau balasan diskusi, submission baru, permintaan masuk kelas, tugas baru, nilai, serta permintaan revisi.
+- Mengarahkan klik notifikasi langsung ke materi, komentar, submission, enrollment, atau tugas terkait.
+- Mempertahankan angka notifikasi sampai objek tujuan benar-benar berhasil dibuka dan menyimpan status baca per pengguna.
+
+### Materi YouTube dan navigasi halaman
+
+- Menambahkan input khusus link YouTube pada form tambah/edit materi dengan validasi di frontend dan backend.
+- Mendukung format `youtube.com`, YouTube Shorts, `youtu.be`, `live`, serta URL embed dan menyimpannya dalam format kanonis.
+- Menampilkan video pada halaman materi mahasiswa sebagai embed responsif 16:9 dengan fullscreen, lazy loading, mode `youtube-nocookie.com`, dan tautan cadangan ke YouTube.
+- Memisahkan scroll formulir dan daftar pada halaman materi serta tugas, termasuk batas tinggi yang sesuai untuk perangkat seluler.
+- Memisahkan scroll daftar pertemuan dan detail materi mahasiswa agar kedua panel dapat dinavigasi secara mandiri.
+
+### Validasi rilis
+
+- Menambahkan test kebijakan storage, agregasi aktivitas, status baca notifikasi, dan normalisasi URL YouTube ke GitHub Actions.
+- Build frontend produksi dan pemeriksaan URL backend lokal pada bundle tetap dijalankan pada setiap verifikasi.
+- Tidak ada migration SQL atau perubahan versi skema PostgreSQL pada rilis ini.
+
 ## [1.0.12] — 2026-07-24
 
 ### Penyelesaian repair identitas mahasiswa
