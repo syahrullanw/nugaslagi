@@ -6,6 +6,20 @@ Semua perubahan penting pada aplikasi ini dicatat di sini. Versi rilis utama dis
 
 Gunakan bagian ini untuk perubahan yang belum dirilis. Setiap perubahan database harus memiliki migration SQL baru yang idempotent dan forward-only; jangan mengubah atau menghapus migration yang sudah pernah diterapkan.
 
+## [1.0.11] — 2026-07-24
+
+### Integritas identitas mahasiswa
+
+- Menolak email, username, NIM, atau WhatsApp duplikat pada registrasi, tambah mahasiswa manual, join kelas legacy, dan import Excel.
+- Menghapus perilaku lama yang diam-diam menambahkan suffix pada username ketika NIM sudah dipakai.
+- Menampilkan jumlah konflik identitas pada hasil import agar baris yang dilewati dapat diperiksa admin.
+- Menolak login dengan identitas ambigu serta mencegah reset password memilih salah satu akun secara acak.
+- Memperbaiki validasi perubahan profil agar konflik email dan username selalu diperiksa, termasuk ketika WhatsApp tidak berubah.
+- Menambahkan unique index PostgreSQL untuk `nim`; data legacy duplikat menggunakan fallback non-unique sementara agar backend tetap dapat start sampai repair selesai.
+- Menambahkan utility repair dengan mode dry-run, token konfirmasi, transaksi, dan guard aktivitas untuk koreksi NIM serta penggabungan akun mahasiswa duplikat.
+- Mendokumentasikan keputusan pemilik data untuk mempertahankan NIM `24010230` pada Rafiq dan akun Haris dengan email berawalan `h***`.
+- Tidak ada migration SQL baru; indeks identitas dibuat secara idempotent oleh startup setelah data duplikat diselesaikan.
+
 ## [1.0.10] — 2026-07-24
 
 ### Hotfix sinkronisasi Google Drive

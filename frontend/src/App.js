@@ -3467,8 +3467,13 @@ function AdminApp({
       );
       await loadAll();
       progress.finish(operation, "Import mahasiswa selesai");
+      const identityConflicts =
+        result.skipped_reasons?.identity_conflict || 0;
+      const conflictInfo = identityConflicts
+        ? `, ${identityConflicts} konflik identitas`
+        : "";
       toast.success(
-        `Import selesai: ${result.created} dibuat, ${result.skipped} dilewati`,
+        `Import selesai: ${result.created} dibuat, ${result.skipped} dilewati${conflictInfo}`,
       );
     } catch (error) {
       const detail = formatApiError(error, "Import gagal");

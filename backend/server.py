@@ -24,6 +24,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from xml.etree import ElementTree
 
 import bcrypt
+from asyncpg.exceptions import UniqueViolationError
 from cryptography.fernet import Fernet, InvalidToken
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
@@ -44,9 +45,19 @@ from starlette.middleware.gzip import GZipMiddleware
 try:
     from .postgres_database import PostgresDatabase
     from .app_version import version_payload
+    from .identity_integrity import (
+        normalize_nim,
+        student_identity_conflict_query,
+        student_identity_values,
+    )
 except ImportError:  # Supports `uvicorn server:app` from the backend directory.
     from postgres_database import PostgresDatabase
     from app_version import version_payload
+    from identity_integrity import (
+        normalize_nim,
+        student_identity_conflict_query,
+        student_identity_values,
+    )
 
 
 ROOT_DIR = Path(__file__).parent
@@ -638,6 +649,30 @@ def identity_query(identifier: str) -> Dict[str, Any]:
     if normalized_phone and normalized_phone != raw:
         candidates.append({"whatsapp": normalized_phone})
     return {"$or": candidates}
+
+
+async def find_unique_identity_user(
+    identifier: str,
+    *,
+    ambiguous_status: int = 409,
+    ambiguous_detail: str = "Identitas terhubung ke lebih dari satu akun. Gunakan email unik atau hubungi admin kampus.",
+) -> Optional[Dict[str, Any]]:
+    users = await db.users.find(identity_query(identifier), {"_id": 0}).to_list(2)
+    if len(users) > 1:
+        raise HTTPException(status_code=ambiguous_status, detail=ambiguous_detail)
+    return users[0] if users else None
+
+
+async def ensure_unique_identity_index(field: str) -> None:
+    try:
+        await db.users.create_index(field, unique=True, sparse=True)
+    except UniqueViolationError:
+        logger.error(
+            "Unique index %s belum dapat diaktifkan karena data lama duplikat; "
+            "fallback non-unique sementara dipasang. Jalankan audit/repair identitas.",
+            field,
+        )
+        await db.users.create_index(field, unique=False, sparse=True)
 
 
 DEFAULT_GRADE_PREDICATES = [
@@ -3418,7 +3453,7 @@ async def login(payload: LoginInput):
     identifier = (payload.identifier or payload.email or "").strip().lower()
     if not identifier:
         raise HTTPException(status_code=400, detail="Username, NIM, nomor HP, atau email diperlukan")
-    user = await db.users.find_one(identity_query(identifier), {"_id": 0})
+    user = await find_unique_identity_user(identifier)
     if not user or not user.get("password_hash") or not verify_password(payload.password, user["password_hash"]):
         raise HTTPException(status_code=401, detail="Identitas login atau password salah")
     if user.get("status", "active") != "active":
@@ -3432,18 +3467,13 @@ async def login(payload: LoginInput):
 
 @api_router.post("/auth/register-student")
 async def register_student(payload: RegisterStudentInput):
-    email = payload.email.lower()
-    username = (payload.username or payload.nim).strip().lower()
+    identity = student_identity_values(payload.email, payload.nim, payload.username, payload.whatsapp)
+    email = identity["email"]
+    username = identity["username"]
+    nim = identity["nim"]
     whatsapp = payload.whatsapp.strip()
     existing = await db.users.find_one(
-        {
-            "$or": [
-                {"email": email},
-                {"username": username},
-                {"nim": payload.nim},
-                {"whatsapp": whatsapp} if whatsapp else {"_never": "_never"},
-            ]
-        },
+        student_identity_conflict_query(email, nim, username, whatsapp),
         {"_id": 0},
     )
     if existing:
@@ -3453,7 +3483,7 @@ async def register_student(payload: RegisterStudentInput):
         "id": student_id,
         "role": "student",
         "username": username,
-        "nim": payload.nim,
+        "nim": nim,
         "name": payload.name,
         "email": email,
         "whatsapp": whatsapp,
@@ -3470,7 +3500,13 @@ async def register_student(payload: RegisterStudentInput):
 @api_router.post("/auth/forgot-password")
 async def forgot_password(payload: ForgotPasswordInput, background_tasks: BackgroundTasks):
     identifier = payload.identifier.strip().lower()
-    user = await db.users.find_one(identity_query(identifier), {"_id": 0})
+    try:
+        user = await find_unique_identity_user(identifier)
+    except HTTPException as exc:
+        if exc.status_code != 409:
+            raise
+        logger.warning("Reset password diabaikan karena identitas ambigu: %s", identifier)
+        user = None
     if not user:
         return {
             "ok": True,
@@ -3585,7 +3621,11 @@ async def forgot_password_message_status(message_id: str):
 @api_router.post("/auth/reset-password-otp")
 async def reset_password_otp(payload: ResetPasswordOtpInput):
     identifier = payload.identifier.strip().lower()
-    user = await db.users.find_one(identity_query(identifier), {"_id": 0})
+    user = await find_unique_identity_user(
+        identifier,
+        ambiguous_status=400,
+        ambiguous_detail="OTP atau akun tidak valid",
+    )
     if not user:
         raise HTTPException(status_code=400, detail="OTP atau akun tidak valid")
     otp_doc = await db.password_reset_otps.find_one(
@@ -3625,23 +3665,41 @@ async def join_class(payload: JoinClassInput):
     class_doc = await db.classes.find_one({"class_code": class_code, "status": "active"}, {"_id": 0})
     if not class_doc:
         raise HTTPException(status_code=404, detail="Kode kelas tidak ditemukan")
-    existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
+    identity = student_identity_values(payload.email, payload.nim, payload.nim, payload.whatsapp)
+    existing = await db.users.find_one({"email": identity["email"]}, {"_id": 0})
     if existing:
         if existing.get("role") != "student":
             raise HTTPException(status_code=409, detail="Email sudah digunakan oleh akun non-mahasiswa")
+        if normalize_nim(existing.get("nim")) != identity["nim"]:
+            raise HTTPException(
+                status_code=409,
+                detail="Email sudah terdaftar dengan NIM berbeda. Gunakan identitas akun yang sudah terdaftar.",
+            )
         if not verify_password(payload.password, existing.get("password_hash", "")):
             raise HTTPException(status_code=401, detail="Password akun mahasiswa salah")
         student_id = existing["id"]
     else:
+        conflict = await db.users.find_one(
+            student_identity_conflict_query(
+                identity["email"],
+                identity["nim"],
+                identity["username"],
+                identity["whatsapp"],
+            ),
+            {"_id": 0, "id": 1},
+        )
+        if conflict:
+            raise HTTPException(status_code=409, detail="Email, username, NIM, atau WhatsApp sudah terdaftar")
         student_id = new_id()
         await db.users.insert_one(
             {
                 "id": student_id,
                 "role": "student",
-                "nim": payload.nim,
+                "username": identity["username"],
+                "nim": identity["nim"],
                 "name": payload.name,
-                "email": payload.email.lower(),
-                "whatsapp": payload.whatsapp,
+                "email": identity["email"],
+                "whatsapp": identity["whatsapp"],
                 "password_hash": hash_password(payload.password),
                 "status": "active",
                 "class_ids": [],
@@ -3668,8 +3726,8 @@ async def join_class(payload: JoinClassInput):
             "lecturer_name": class_doc.get("lecturer_name", ""),
             "student_id": student_id,
             "student_name": (existing or {}).get("name") or payload.name,
-            "student_nim": (existing or {}).get("nim") or payload.nim,
-            "student_email": payload.email.lower(),
+            "student_nim": (existing or {}).get("nim") or identity["nim"],
+            "student_email": identity["email"],
             "status": "pending",
             "requested_at": now_iso(),
             "source": "legacy_join_class",
@@ -3699,13 +3757,12 @@ async def update_profile(payload: ProfileInput, user: Dict[str, Any] = Depends(g
     candidates: List[Dict[str, Any]] = [{"email": email}, {"username": username}]
     if whatsapp and normalize_phone(whatsapp) != normalize_phone(current_whatsapp):
         candidates.append({"whatsapp": whatsapp})
-    if len(candidates) > 2:
-        existing = await db.users.find_one(
-            {"id": {"$ne": user["id"]}, "$or": candidates},
-            {"_id": 0, "id": 1},
-        )
-        if existing:
-            raise HTTPException(status_code=409, detail="Email, username, atau WhatsApp sudah digunakan akun lain")
+    existing = await db.users.find_one(
+        {"id": {"$ne": user["id"]}, "$or": candidates},
+        {"_id": 0, "id": 1},
+    )
+    if existing:
+        raise HTTPException(status_code=409, detail="Email, username, atau WhatsApp sudah digunakan akun lain")
     await db.users.update_one(
         {"id": user["id"]},
         {
@@ -5166,22 +5223,28 @@ async def list_students(user: Dict[str, Any] = Depends(require_admin)):
 
 @api_router.post("/students")
 async def create_student(payload: StudentInput, user: Dict[str, Any] = Depends(require_campus_admin)):
-    class_doc = await require_class_mutation_access(payload.class_id, user)
-    existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
+    await require_class_mutation_access(payload.class_id, user)
+    identity = student_identity_values(payload.email, payload.nim, payload.nim, payload.whatsapp)
+    existing = await db.users.find_one(
+        student_identity_conflict_query(
+            identity["email"],
+            identity["nim"],
+            identity["username"],
+            identity["whatsapp"],
+        ),
+        {"_id": 0},
+    )
     if existing:
-        raise HTTPException(status_code=409, detail="Email mahasiswa sudah digunakan")
+        raise HTTPException(status_code=409, detail="Email, username, NIM, atau WhatsApp mahasiswa sudah digunakan")
     student_id = new_id()
-    username = payload.nim.strip().lower()
-    if await db.users.find_one({"username": username}, {"_id": 0, "id": 1}):
-        username = f"{username}-{student_id[:6]}"
     doc = {
         "id": student_id,
         "role": "student",
-        "username": username,
-        "nim": payload.nim,
+        "username": identity["username"],
+        "nim": identity["nim"],
         "name": payload.name,
-        "email": payload.email.lower(),
-        "whatsapp": payload.whatsapp,
+        "email": identity["email"],
+        "whatsapp": identity["whatsapp"],
         "password_hash": hash_password(payload.password),
         "status": payload.status,
         "class_ids": [payload.class_id],
@@ -5216,21 +5279,50 @@ async def import_students(
 
     created = 0
     skipped = 0
+    skipped_reasons = {
+        "invalid_row": 0,
+        "identity_conflict": 0,
+        "invalid_password": 0,
+    }
+    conflicts: List[Dict[str, Any]] = []
     password_from_column = 0
     password_from_default = 0
     password_from_nim = 0
-    for row in sheet.iter_rows(min_row=2, values_only=True):
+    for row_number, row in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
         nim = row_value(row, ["nim"], 0)
         name = row_value(row, ["nama", "name"], 1)
         email = row_value(row, ["email"], 2).lower()
         whatsapp = row_value(row, ["whatsapp", "wa", "no hp", "nomor hp"], 3)
-        if not nim or not name or not email or await db.users.find_one({"email": email}, {"_id": 0}):
+        if not nim or not name or not email:
             skipped += 1
+            skipped_reasons["invalid_row"] += 1
+            continue
+        identity = student_identity_values(email, nim, nim, whatsapp)
+        conflict = await db.users.find_one(
+            student_identity_conflict_query(
+                identity["email"],
+                identity["nim"],
+                identity["username"],
+                identity["whatsapp"],
+            ),
+            {"_id": 0, "id": 1},
+        )
+        if conflict:
+            skipped += 1
+            skipped_reasons["identity_conflict"] += 1
+            conflicts.append(
+                {
+                    "row": row_number,
+                    "nim": identity["nim"],
+                    "reason": "Email, username, NIM, atau WhatsApp sudah terdaftar",
+                }
+            )
             continue
         row_password = row_value(row, ["password", "pass", "sandi", "kata sandi", "kata_sandi"])
-        password = row_password or default_import_password or nim
+        password = row_password or default_import_password or identity["nim"]
         if len(password) < 3:
             skipped += 1
+            skipped_reasons["invalid_password"] += 1
             continue
         if row_password:
             password_from_column += 1
@@ -5239,18 +5331,15 @@ async def import_students(
         else:
             password_from_nim += 1
         student_id = new_id()
-        username = nim.lower()
-        if await db.users.find_one({"username": username}, {"_id": 0, "id": 1}):
-            username = f"{username}-{student_id[:6]}"
         await db.users.insert_one(
             {
                 "id": student_id,
                 "role": "student",
-                "username": username,
-                "nim": nim,
+                "username": identity["username"],
+                "nim": identity["nim"],
                 "name": name,
-                "email": email,
-                "whatsapp": whatsapp,
+                "email": identity["email"],
+                "whatsapp": identity["whatsapp"],
                 "password_hash": hash_password(password),
                 "status": "active",
                 "class_ids": [class_id],
@@ -5260,9 +5349,12 @@ async def import_students(
         )
         await db.classes.update_one({"id": class_id}, {"$addToSet": {"student_ids": student_id}})
         created += 1
+    workbook.close()
     return {
         "created": created,
         "skipped": skipped,
+        "skipped_reasons": skipped_reasons,
+        "conflicts": conflicts[:100],
         "password_from_column": password_from_column,
         "password_from_default": password_from_default,
         "password_from_nim": password_from_nim,
@@ -6993,7 +7085,8 @@ async def on_startup():
         if material:
             await db.assignments.update_one({"id": assignment["id"]}, {"$set": {"material_id": material["id"]}})
     await db.users.create_index("email", unique=True)
-    await db.users.create_index("username", unique=True, sparse=True)
+    await ensure_unique_identity_index("username")
+    await ensure_unique_identity_index("nim")
     await db.users.create_index("name")
     await db.users.create_index([("sso_issuer", 1), ("sso_subject", 1)], unique=True, sparse=True)
     await db.sessions.create_index("token", unique=True)
